@@ -56,6 +56,9 @@ class RecordingConfig:
     # Sampling
     sample_interval: float = 0.008  # 8ms = 125Hz
 
+    # Debug
+    debug: bool = True  # Enable debug output
+
 
 # =============================================================================
 # CURSOR TRACKER (thread-safe - called from pynput thread)
@@ -230,21 +233,46 @@ class RecordingUI:
                 slow_time = time.perf_counter()
 
             # Start recording: was slow, now moving
-            # Use the SLOW position as first point (when velocity was actually low)
+            # Use the CURRENT position as first point - this is where movement began
+            # (Using slow_pos causes high start velocities because cursor already moved)
             if not recording and was_slow and speed > self.config.movement_threshold:
                 recording = True
                 was_slow = False
-                rec_positions = [slow_pos]  # Start from slow position
-                rec_timestamps = [slow_time]
-                last_sample_time = slow_time
-                rec_start = slow_pos
+                now = time.perf_counter()
+                rec_positions = [pos]  # Start from CURRENT position (where movement detected)
+                rec_timestamps = [now]  # Use current time
+                last_sample_time = now  # Wait full interval before next sample
+                rec_start = pos
                 rec_target = target
                 trail.clear()
+
+                if self.config.debug:
+                    dist_from_slow = math.sqrt((pos[0] - slow_pos[0])**2 + (pos[1] - slow_pos[1])**2)
+                    dt_from_slow = now - slow_time
+                    implied_vel = dist_from_slow / dt_from_slow if dt_from_slow > 0 else 0
+                    print(f"\n  [DEBUG] RECORDING START")
+                    print(f"    slow_pos (NOT USED): ({slow_pos[0]:.1f}, {slow_pos[1]:.1f})")
+                    print(f"    current_pos (USED): ({pos[0]:.1f}, {pos[1]:.1f})")
+                    print(f"    pynput speed: {speed:.1f} px/s")
+                    print(f"    dist from slow_pos: {dist_from_slow:.1f} px")
+                    print(f"    dt from slow_time: {dt_from_slow*1000:.1f} ms")
+                    print(f"    (old implied velocity: {implied_vel:.1f} px/s - avoided)")
 
             # Record point at fixed 125Hz interval
             if recording:
                 now = time.perf_counter()
                 if now - last_sample_time >= self.config.sample_interval:
+                    # Debug: compute velocity from previous point
+                    if self.config.debug and len(rec_positions) > 0:
+                        prev_pos = rec_positions[-1]
+                        prev_time = rec_timestamps[-1]
+                        dt = now - prev_time
+                        dist = math.sqrt((pos[0] - prev_pos[0])**2 + (pos[1] - prev_pos[1])**2)
+                        vel = dist / dt if dt > 0 else 0
+                        if len(rec_positions) <= 5:  # Only first few points
+                            print(f"    [DEBUG] pt{len(rec_positions)}: pos=({pos[0]:.1f},{pos[1]:.1f}) "
+                                  f"dt={dt*1000:.1f}ms dist={dist:.1f}px vel={vel:.1f}px/s")
+
                     rec_positions.append(pos)
                     rec_timestamps.append(now)
                     last_sample_time = now
@@ -260,6 +288,24 @@ class RecordingUI:
 
                 # Save if valid
                 if len(rec_positions) >= self.config.min_trajectory_points:
+                    # Debug: compute start/end velocities before saving
+                    if self.config.debug and len(rec_positions) >= 2:
+                        # Start velocity (first segment)
+                        dx = rec_positions[1][0] - rec_positions[0][0]
+                        dy = rec_positions[1][1] - rec_positions[0][1]
+                        dt = rec_timestamps[1] - rec_timestamps[0]
+                        start_vel = math.sqrt(dx*dx + dy*dy) / dt if dt > 0 else 0
+
+                        # End velocity (last segment)
+                        dx = rec_positions[-1][0] - rec_positions[-2][0]
+                        dy = rec_positions[-1][1] - rec_positions[-2][1]
+                        dt = rec_timestamps[-1] - rec_timestamps[-2]
+                        end_vel = math.sqrt(dx*dx + dy*dy) / dt if dt > 0 else 0
+
+                        print(f"  [DEBUG] RECORDING END")
+                        print(f"    start_vel: {start_vel:.1f} px/s, end_vel: {end_vel:.1f} px/s")
+                        print(f"    pynput speed at end: {speed:.1f} px/s")
+
                     self._save_trajectory(
                         rec_positions, rec_timestamps, rec_start, rec_target,
                         timestamp, saved_count
