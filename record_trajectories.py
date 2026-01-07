@@ -724,135 +724,29 @@ class RecordingUI:
 
 
 # =============================================================================
-# CONSOLE RECORDING (Legacy/Fallback)
-# =============================================================================
-
-def record_trajectories_console(output_dir: Path, duration_seconds: int = 300) -> int:
-    """
-    Console-based recording (no UI).
-    Records mouse movements and segments them into trajectories based on idle time.
-    
-    Args:
-        output_dir: Directory to save trajectory JSON files
-        duration_seconds: Recording duration in seconds
-    
-    Returns:
-        Number of trajectories recorded
-    """
-    if not HAS_PYNPUT:
-        print("ERROR: pynput required for recording. Install with: pip install pynput")
-        return 0
-    
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    print(f"\n{'='*60}")
-    print("TRAJECTORY RECORDING (Console Mode)")
-    print(f"{'='*60}")
-    print(f"Duration: {duration_seconds}s")
-    print(f"Output: {output_dir}")
-    print("\nMove your mouse naturally. Recording starts now!")
-    print("Press Ctrl+C to stop early.\n")
-    
-    # Thread-safe state using locks
-    lock = threading.Lock()
-    current_trajectory = {'x': [], 'y': [], 'timestamps': []}
-    trajectories = []
-    last_move_time = [time.time()]  # Using list for mutable reference
-    idle_threshold = 0.5
-    
-    def on_move(x, y):
-        nonlocal current_trajectory
-        now = time.time()
-        
-        with lock:
-            # Check for idle (new trajectory)
-            if now - last_move_time[0] > idle_threshold and current_trajectory['x']:
-                if len(current_trajectory['x']) >= 20:
-                    trajectories.append(current_trajectory.copy())
-                current_trajectory = {'x': [], 'y': [], 'timestamps': []}
-            
-            current_trajectory['x'].append(float(x))
-            current_trajectory['y'].append(float(y))
-            current_trajectory['timestamps'].append(now)
-            last_move_time[0] = now
-    
-    listener = mouse.Listener(on_move=on_move)
-    listener.start()
-    
-    start_time = time.time()
-    
-    try:
-        while time.time() - start_time < duration_seconds:
-            elapsed = time.time() - start_time
-            with lock:
-                traj_count = len(trajectories)
-            print(f"\rRecording: {elapsed:.0f}s / {duration_seconds}s | Trajectories: {traj_count}", end='')
-            time.sleep(0.5)
-    except KeyboardInterrupt:
-        print("\n\nStopped early.")
-    
-    listener.stop()
-    
-    # Save final trajectory
-    with lock:
-        if len(current_trajectory['x']) >= 20:
-            trajectories.append(current_trajectory.copy())
-    
-    print(f"\n\nRecorded {len(trajectories)} trajectories")
-    
-    # Save as JSON files
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    for i, traj in enumerate(trajectories):
-        filename = output_dir / f"console_{timestamp}_{i:04d}.json"
-        
-        x, y = np.array(traj['x']), np.array(traj['y'])
-        ts = traj['timestamps']
-        ideal_dist = float(np.sqrt((x[-1] - x[0])**2 + (y[-1] - y[0])**2))
-        diffs = np.sqrt(np.diff(x)**2 + np.diff(y)**2)
-        actual_dist = float(np.sum(diffs))
-        duration_ms = (ts[-1] - ts[0]) * 1000 if len(ts) >= 2 else 0.0
-
-        data = {
-            'x': traj['x'],
-            'y': traj['y'],
-            'timestamps': ts,
-            'start': [float(x[0]), float(y[0])],
-            'target': [float(x[-1]), float(y[-1])],
-            'ideal_distance': ideal_dist,
-            'actual_distance': actual_dist,
-            'duration_ms': duration_ms,
-            'point_count': len(traj['x']),
-        }
-
-        with open(filename, 'w') as f:
-            json.dump(data, f, indent=2)
-    
-    print(f"Saved to {output_dir}")
-    return len(trajectories)
-
-
-# =============================================================================
 # MAIN API FUNCTION
 # =============================================================================
 
-def record_trajectories(output_dir: Path, duration: Optional[int] = None, 
+def record_trajectories(output_dir: Path, duration: Optional[int] = None,
                         target_count: Optional[int] = None) -> int:
     """
     Record trajectories using the fullscreen UI.
-    
+
     Args:
         output_dir: Directory to save trajectory JSON files
         duration: Recording duration in seconds (optional)
         target_count: Number of targets to hit (optional)
-    
+
     Returns:
         Number of trajectories recorded
     """
-    if not HAS_PYGAME or not HAS_PYNPUT:
-        print("Pygame or pynput not available. Falling back to console mode.")
-        return record_trajectories_console(output_dir, duration or 300)
-    
+    if not HAS_PYGAME:
+        print("ERROR: pygame required. Install with: pip install pygame")
+        return 0
+    if not HAS_PYNPUT:
+        print("ERROR: pynput required. Install with: pip install pynput")
+        return 0
+
     config = RecordingConfig()
     ui = RecordingUI(config, output_dir, duration=duration, target_count=target_count)
     return ui.run()
@@ -868,15 +762,12 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    # Record 50 trajectories with fullscreen UI (recommended)
+    # Record 50 trajectories (recommended)
     python record_trajectories.py --targets 50
-    
+
     # Record for 5 minutes
     python record_trajectories.py --duration 300
-    
-    # Console-only recording (no pygame required)
-    python record_trajectories.py --console --duration 60
-    
+
     # Custom output directory
     python record_trajectories.py --output my_trajectories/ --targets 100
 
@@ -884,42 +775,36 @@ After recording, train the model with:
     python train_streaming_mamba.py --data recorded_trajectories/ --epochs 100 --gpu-optimized
         """
     )
-    
+
     parser.add_argument('--output', '-o', type=str, default='recorded_trajectories',
                         help='Output directory for trajectory JSON files (default: recorded_trajectories)')
     parser.add_argument('--targets', '-t', type=int, default=None,
                         help='Number of targets to hit (recommended method)')
     parser.add_argument('--duration', '-d', type=int, default=None,
                         help='Recording duration in seconds')
-    parser.add_argument('--console', '-c', action='store_true',
-                        help='Use console-only recording (no pygame UI)')
-    
+
     args = parser.parse_args()
-    
+
     output_dir = Path(args.output)
-    
+
     # Check dependencies
     if not HAS_PYNPUT:
         print("ERROR: pynput required for mouse tracking.")
         print("Install with: pip install pynput")
         return
-    
-    if not args.console and not HAS_PYGAME:
-        print("WARNING: pygame not available. Falling back to console mode.")
-        print("Install pygame for fullscreen UI: pip install pygame")
-        args.console = True
-    
+
+    if not HAS_PYGAME:
+        print("ERROR: pygame required for recording UI.")
+        print("Install with: pip install pygame")
+        return
+
     # Run recording
-    if args.console:
-        duration = args.duration or 300
-        count = record_trajectories_console(output_dir, duration)
-    else:
-        if args.targets is None and args.duration is None:
-            args.targets = 50
-            print("No --targets or --duration specified. Defaulting to 50 targets.")
-        
-        count = record_trajectories(output_dir, duration=args.duration, target_count=args.targets)
-    
+    if args.targets is None and args.duration is None:
+        args.targets = 50
+        print("No --targets or --duration specified. Defaulting to 50 targets.")
+
+    count = record_trajectories(output_dir, duration=args.duration, target_count=args.targets)
+
     # Print next steps
     if count > 0:
         print(f"\nNext step - train the model:")
