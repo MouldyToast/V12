@@ -85,6 +85,9 @@ class CursorTracker:
     def get_state(self) -> Tuple[float, float, float]:
         """Returns (x, y, speed). Called from main thread."""
         with self._lock:
+            # If no updates for 50ms, cursor is stationary (velocity = 0)
+            if self._last_time > 0 and (time.perf_counter() - self._last_time) > 0.05:
+                return self._x, self._y, 0.0
             speed = math.sqrt(self._vx ** 2 + self._vy ** 2)
             return self._x, self._y, speed
 
