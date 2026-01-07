@@ -62,11 +62,10 @@ class RecordingConfig:
     target_radius: int = 30
     min_target_dist: int = 200
     max_target_dist: int = 800
-    
+
     # Recording
     min_trajectory_points: int = 20
-    sample_rate: int = 125  # Hz (for metadata)
-    
+
     # UI
     screen_margin: int = 100
 
@@ -76,8 +75,8 @@ class RecordingConfig:
 # =============================================================================
 
 class CursorTracker:
-    """Thread-safe cursor state tracking with velocity/acceleration computation."""
-    
+    """Thread-safe cursor state tracking with velocity computation."""
+
     def __init__(self, max_history: int = 500):
         self._lock = threading.RLock()  # Reentrant lock for nested calls
         self._positions: deque = deque(maxlen=max_history)
@@ -86,80 +85,39 @@ class CursorTracker:
         self._y: float = 0.0
         self._vx: float = 0.0
         self._vy: float = 0.0
-        self._ax: float = 0.0
-        self._ay: float = 0.0
-        self._last_update: float = 0.0
-    
+
     def update(self, x: float, y: float) -> None:
-        """Thread-safe position update with velocity/acceleration computation."""
+        """Thread-safe position update with velocity computation."""
         now = time.perf_counter()
-        
+
         with self._lock:
             if self._timestamps:
                 dt = now - self._timestamps[-1]
                 if dt > 0.0005:  # Minimum 0.5ms between updates
-                    # Compute velocity
-                    new_vx = (x - self._x) / dt
-                    new_vy = (y - self._y) / dt
-                    
-                    # Compute acceleration
-                    self._ax = (new_vx - self._vx) / dt
-                    self._ay = (new_vy - self._vy) / dt
-                    
-                    self._vx = new_vx
-                    self._vy = new_vy
-            
+                    self._vx = (x - self._x) / dt
+                    self._vy = (y - self._y) / dt
+
             self._x = x
             self._y = y
             self._positions.append((x, y))
             self._timestamps.append(now)
-            self._last_update = now
     
     def get_position(self) -> Tuple[float, float]:
         """Thread-safe position getter."""
         with self._lock:
             return (self._x, self._y)
-    
-    def get_state(self) -> np.ndarray:
-        """Get full state vector [x, y, vx, vy, ax, ay]."""
-        with self._lock:
-            return np.array([
-                self._x, self._y,
-                self._vx, self._vy,
-                self._ax, self._ay
-            ], dtype=np.float32)
-    
+
     def get_speed(self) -> float:
         """Get current speed magnitude."""
         with self._lock:
             return math.sqrt(self._vx ** 2 + self._vy ** 2)
-    
+
     def get_recent_positions(self, n: Optional[int] = None) -> List[Tuple[float, float]]:
         """Get recent position history."""
         with self._lock:
             if n is None:
                 return list(self._positions)
             return list(self._positions)[-n:]
-    
-    def get_recent_timestamps(self, n: Optional[int] = None) -> List[float]:
-        """Get recent timestamp history."""
-        with self._lock:
-            if n is None:
-                return list(self._timestamps)
-            return list(self._timestamps)[-n:]
-    
-    def clear_history(self) -> None:
-        """Clear position history (keeps current state)."""
-        with self._lock:
-            self._positions.clear()
-            self._timestamps.clear()
-    
-    def time_since_update(self) -> float:
-        """Time since last position update."""
-        with self._lock:
-            if self._last_update == 0:
-                return float('inf')
-            return time.perf_counter() - self._last_update
 
 
 # =============================================================================
@@ -290,59 +248,49 @@ class TrajectoryRecorder:
 
 class TargetManager:
     """Manages target spawning and hit detection."""
-    
+
     def __init__(self, config: RecordingConfig, screen_width: int, screen_height: int):
         self.config = config
         self.width = screen_width
         self.height = screen_height
         self._lock = threading.Lock()
         self._target: Optional[Tuple[float, float]] = None
-        self._spawn_time: float = 0.0
-    
+
     def spawn_target(self, from_pos: Tuple[float, float]) -> Tuple[float, float]:
         """Spawn a new target at a random position away from the cursor."""
         with self._lock:
             # Random angle and distance
             angle = random.uniform(0, 2 * math.pi)
             dist = random.uniform(self.config.min_target_dist, self.config.max_target_dist)
-            
+
             # Calculate target position
             tx = from_pos[0] + dist * math.cos(angle)
             ty = from_pos[1] + dist * math.sin(angle)
-            
+
             # Clamp to screen bounds with margin
             margin = self.config.screen_margin
             tx = max(margin, min(self.width - margin, tx))
             ty = max(margin, min(self.height - margin, ty))
-            
+
             self._target = (tx, ty)
-            self._spawn_time = time.perf_counter()
-            
             return self._target
-    
+
     def check_hit(self, pos: Tuple[float, float]) -> bool:
         """Check if position hits the current target."""
         with self._lock:
             if self._target is None:
                 return False
-            
+
             dx = pos[0] - self._target[0]
             dy = pos[1] - self._target[1]
             distance = math.sqrt(dx*dx + dy*dy)
-            
+
             return distance < self.config.target_radius
-    
+
     @property
     def target(self) -> Optional[Tuple[float, float]]:
         with self._lock:
             return self._target
-    
-    @property
-    def time_since_spawn(self) -> float:
-        with self._lock:
-            if self._spawn_time == 0:
-                return 0.0
-            return time.perf_counter() - self._spawn_time
 
 
 # =============================================================================
@@ -351,32 +299,27 @@ class TargetManager:
 
 class RecordingSession:
     """Manages a complete recording session with all trajectories."""
-    
+
     def __init__(self, output_dir: Path, config: RecordingConfig):
         self.output_dir = output_dir
         self.config = config
         self._lock = threading.Lock()
         self._trajectories: List[RecordedTrajectory] = []
-        self._start_time: float = time.perf_counter()
-        
+
         # Create output directory
         self.output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     def add_trajectory(self, traj: RecordedTrajectory) -> int:
         """Add a trajectory to the session. Returns trajectory count."""
         with self._lock:
             self._trajectories.append(traj)
             return len(self._trajectories)
-    
+
     @property
     def trajectory_count(self) -> int:
         with self._lock:
             return len(self._trajectories)
-    
-    @property
-    def elapsed_time(self) -> float:
-        return time.perf_counter() - self._start_time
-    
+
     @property
     def total_points(self) -> int:
         with self._lock:
@@ -567,7 +510,7 @@ class RecordingUI:
             
             # Draw stats panel (on background layer, so targets appear on top)
             target = self.target_manager.target
-            self._draw_stats_panel(screen, screen_w, screen_h, elapsed, target)
+            self._draw_stats_panel(screen, screen_w, screen_h, elapsed)
             
             # Get current state
             pos = self.cursor_tracker.get_position()
@@ -697,8 +640,8 @@ class RecordingUI:
         if self.cursor_tracker:
             self.cursor_tracker.update(x, y)
     
-    def _draw_stats_panel(self, screen, screen_w: int, screen_h: int, 
-                            elapsed: float, target_pos: Optional[Tuple[float, float]]) -> None:
+    def _draw_stats_panel(self, screen, screen_w: int, screen_h: int,
+                          elapsed: float) -> None:
         """Draw the statistics panel with transparency."""
         stats = self.session.get_stats() if self.session else {}
         
@@ -849,20 +792,26 @@ def record_trajectories_console(output_dir: Path, duration_seconds: int = 300) -
         filename = output_dir / f"console_{timestamp}_{i:04d}.json"
         
         x, y = np.array(traj['x']), np.array(traj['y'])
+        ts = traj['timestamps']
         ideal_dist = float(np.sqrt((x[-1] - x[0])**2 + (y[-1] - y[0])**2))
         diffs = np.sqrt(np.diff(x)**2 + np.diff(y)**2)
         actual_dist = float(np.sum(diffs))
-        
+        duration_ms = (ts[-1] - ts[0]) * 1000 if len(ts) >= 2 else 0.0
+
         data = {
             'x': traj['x'],
             'y': traj['y'],
-            'timestamps': traj['timestamps'],
+            'timestamps': ts,
+            'start': [float(x[0]), float(y[0])],
+            'target': [float(x[-1]), float(y[-1])],
             'ideal_distance': ideal_dist,
             'actual_distance': actual_dist,
+            'duration_ms': duration_ms,
+            'point_count': len(traj['x']),
         }
-        
+
         with open(filename, 'w') as f:
-            json.dump(data, f)
+            json.dump(data, f, indent=2)
     
     print(f"Saved to {output_dir}")
     return len(trajectories)
