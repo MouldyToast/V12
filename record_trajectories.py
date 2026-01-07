@@ -166,6 +166,8 @@ class RecordingUI:
         # Recording state (single source of truth)
         recording = False
         was_slow = True
+        slow_pos: Tuple[float, float] = (x, y)  # Position when cursor was slow
+        slow_time: float = time.perf_counter()   # Time when cursor was slow
         rec_positions: List[Tuple[float, float]] = []
         rec_timestamps: List[float] = []
         rec_start: Tuple[float, float] = (0, 0)
@@ -200,6 +202,8 @@ class RecordingUI:
                     elif event.key == pygame.K_r:
                         recording = False
                         was_slow = True
+                        slow_pos = tracker.get_state()[:2]
+                        slow_time = time.perf_counter()
                         rec_positions.clear()
                         trail.clear()
                         x, y, _ = tracker.get_state()
@@ -219,19 +223,21 @@ class RecordingUI:
             if not trail or abs(x - trail[-1][0]) > 1 or abs(y - trail[-1][1]) > 1:
                 trail.append(pos)
 
-            # Recording state machine
+            # Recording state machine - track when cursor is slow
             if speed < self.config.start_velocity_threshold:
                 was_slow = True
+                slow_pos = pos
+                slow_time = time.perf_counter()
 
             # Start recording: was slow, now moving
+            # Use the SLOW position as first point (when velocity was actually low)
             if not recording and was_slow and speed > self.config.movement_threshold:
                 recording = True
                 was_slow = False
-                now = time.perf_counter()
-                rec_positions = [pos]
-                rec_timestamps = [now]
-                last_sample_time = now
-                rec_start = pos
+                rec_positions = [slow_pos]  # Start from slow position
+                rec_timestamps = [slow_time]
+                last_sample_time = slow_time
+                rec_start = slow_pos
                 rec_target = target
                 trail.clear()
 
