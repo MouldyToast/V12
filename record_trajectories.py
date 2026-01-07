@@ -63,6 +63,11 @@ class RecordingConfig:
     min_target_dist: int = 200
     max_target_dist: int = 800
 
+    # Recording velocity thresholds
+    start_velocity_threshold: float = 2.0   # px/s - max velocity for valid start (must be slow)
+    end_velocity_threshold: float = 2.0     # px/s - max velocity for valid end (must settle)
+    movement_threshold: float = 50.0        # px/s - min velocity to detect movement began
+
     # Recording
     min_trajectory_points: int = 20
 
@@ -455,7 +460,7 @@ class RecordingUI:
         trail = deque(maxlen=150)
         hit_flash = 0
         recording_started = False
-        movement_threshold = 50  # pixels/second to start recording
+        was_slow = True  # Track if cursor was recently at low velocity (ready to start)
         
         print(f"\n{'='*60}")
         print("TRAJECTORY RECORDING")
@@ -484,6 +489,7 @@ class RecordingUI:
                         # Reset/skip current target
                         self.recorder.cancel_recording()
                         recording_started = False
+                        was_slow = True  # Ready for next trajectory
                         trail.clear()
                         pos = self.cursor_tracker.get_position()
                         self.target_manager.spawn_target(pos)
@@ -520,29 +526,38 @@ class RecordingUI:
             if not trail or (abs(pos[0] - trail[-1][0]) > 1 or abs(pos[1] - trail[-1][1]) > 1):
                 trail.append(pos)
             
-            # Recording logic
-            if target and not recording_started and speed > movement_threshold:
-                # Start recording when movement begins
+            # Recording logic - requires starting from rest and ending at rest
+            # Track if cursor is at low velocity (ready to start a new trajectory)
+            if speed < self.config.start_velocity_threshold:
+                was_slow = True
+
+            # Start recording: must have been slow, then started moving
+            if target and not recording_started and was_slow and speed > self.config.movement_threshold:
                 recording_started = True
+                was_slow = False  # Reset for next trajectory
                 start_pos = self.cursor_tracker.get_recent_positions(1)[0] if self.cursor_tracker.get_recent_positions() else pos
                 self.recorder.start_recording(start_pos, target)
                 trail.clear()
-            
+
             if self.recorder.is_recording:
                 self.recorder.record_point(pos)
-            
-            # Check for target hit
-            if target and self.target_manager.check_hit(pos):
+
+            # Check for target hit - only complete when velocity is low (settled on target)
+            in_target = target and self.target_manager.check_hit(pos)
+            velocity_settled = speed < self.config.end_velocity_threshold
+
+            if in_target and velocity_settled:
                 hit_flash = 25
-                
+
                 # Stop recording and save trajectory
                 traj = self.recorder.stop_recording()
                 if traj:
                     count = self.session.add_trajectory(traj)
-                    print(f"  âœ“ Trajectory {count}: {traj.point_count} points, {traj.duration_ms:.0f}ms")
-                
+                    print(f"  [OK] Trajectory {count}: {traj.point_count} points, {traj.duration_ms:.0f}ms")
+
                 # Spawn new target
                 recording_started = False
+                was_slow = True  # Ready for next trajectory
                 trail.clear()
                 self.target_manager.spawn_target(pos)
             
