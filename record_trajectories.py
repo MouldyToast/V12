@@ -15,12 +15,6 @@ Usage:
     # Record 50 trajectories with fullscreen UI (recommended)
     python record_trajectories.py --targets 50
     
-    # Record for 5 minutes
-    python record_trajectories.py --duration 300
-    
-    # Console-only recording (no pygame required)
-    python record_trajectories.py --console --duration 60
-    
     # Custom output directory
     python record_trajectories.py --output my_trajectories/ --targets 100
 """
@@ -64,9 +58,9 @@ class RecordingConfig:
     max_target_dist: int = 800
 
     # Recording velocity thresholds
-    start_velocity_threshold: float = 2.0   # px/s - max velocity for valid start (must be slow)
-    end_velocity_threshold: float = 2.0     # px/s - max velocity for valid end (must settle)
-    movement_threshold: float = 50.0        # px/s - min velocity to detect movement began
+    start_velocity_threshold: float = 500.0   # px/s - max velocity for valid start (must be slow)
+    end_velocity_threshold: float = 500.0     # px/s - max velocity for valid end (must settle)
+    movement_threshold: float = 5.0        # px/s - min velocity to detect movement began
 
     # Recording
     min_trajectory_points: int = 20
@@ -625,7 +619,7 @@ class RecordingUI:
             
             # Recording indicator
             if self.recorder.is_recording:
-                rec_text = f"â— RECORDING ({self.recorder.current_point_count} pts)"
+                rec_text = f" RECORDING ({self.recorder.current_point_count} pts)"
                 rec_surf = self.font_md.render(rec_text, True, self.COLORS['warning'])
                 screen.blit(rec_surf, (screen_w // 2 - rec_surf.get_width() // 2, 25))
             
@@ -760,28 +754,12 @@ def main():
     parser = argparse.ArgumentParser(
         description='Record mouse trajectories for cursor path prediction training',
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-    # Record 50 trajectories (recommended)
-    python record_trajectories.py --targets 50
-
-    # Record for 5 minutes
-    python record_trajectories.py --duration 300
-
-    # Custom output directory
-    python record_trajectories.py --output my_trajectories/ --targets 100
-
-After recording, train the model with:
-    python train_streaming_mamba.py --data recorded_trajectories/ --epochs 100 --gpu-optimized
-        """
     )
 
     parser.add_argument('--output', '-o', type=str, default='recorded_trajectories',
                         help='Output directory for trajectory JSON files (default: recorded_trajectories)')
-    parser.add_argument('--targets', '-t', type=int, default=None,
+    parser.add_argument('--targets', '-t', type=int, default=50,
                         help='Number of targets to hit (recommended method)')
-    parser.add_argument('--duration', '-d', type=int, default=None,
-                        help='Recording duration in seconds')
 
     args = parser.parse_args()
 
@@ -790,20 +768,18 @@ After recording, train the model with:
     # Check dependencies
     if not HAS_PYNPUT:
         print("ERROR: pynput required for mouse tracking.")
-        print("Install with: pip install pynput")
         return
 
     if not HAS_PYGAME:
         print("ERROR: pygame required for recording UI.")
-        print("Install with: pip install pygame")
         return
 
     # Run recording
-    if args.targets is None and args.duration is None:
+    if args.targets is None:
         args.targets = 50
         print("No --targets or --duration specified. Defaulting to 50 targets.")
 
-    count = record_trajectories(output_dir, duration=args.duration, target_count=args.targets)
+    count = record_trajectories(output_dir, target_count=args.targets)
 
     # Print next steps
     if count > 0:
