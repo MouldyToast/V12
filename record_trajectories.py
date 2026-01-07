@@ -53,6 +53,9 @@ class RecordingConfig:
     end_velocity_threshold: float = 500.0    # px/s - must be below this to end
     movement_threshold: float = 5.0          # px/s - detect movement began
 
+    # Sampling
+    sample_interval: float = 0.008  # 8ms = 125Hz
+
 
 # =============================================================================
 # CURSOR TRACKER (thread-safe - called from pynput thread)
@@ -167,6 +170,7 @@ class RecordingUI:
         rec_timestamps: List[float] = []
         rec_start: Tuple[float, float] = (0, 0)
         rec_target: Tuple[float, float] = (0, 0)
+        last_sample_time: float = 0.0
 
         # Session stats
         saved_count = 0
@@ -223,16 +227,21 @@ class RecordingUI:
             if not recording and was_slow and speed > self.config.movement_threshold:
                 recording = True
                 was_slow = False
+                now = time.perf_counter()
                 rec_positions = [pos]
-                rec_timestamps = [time.perf_counter()]
+                rec_timestamps = [now]
+                last_sample_time = now
                 rec_start = pos
                 rec_target = target
                 trail.clear()
 
-            # Record point
+            # Record point at fixed 125Hz interval
             if recording:
-                rec_positions.append(pos)
-                rec_timestamps.append(time.perf_counter())
+                now = time.perf_counter()
+                if now - last_sample_time >= self.config.sample_interval:
+                    rec_positions.append(pos)
+                    rec_timestamps.append(now)
+                    last_sample_time = now
 
             # Check target hit (only if recording!)
             dx, dy = x - target[0], y - target[1]
