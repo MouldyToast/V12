@@ -87,12 +87,26 @@ def load_trajectory(filepath: Path) -> dict:
         return json.load(f)
 
 
-def compute_velocities(x: List[float], y: List[float],
-                       timestamps: List[float]) -> np.ndarray:
+def get_timestamps_sec(traj: dict) -> List[float]:
+    """Get timestamps in seconds. Handles both old and new format."""
+    if 't' in traj:
+        # New format: 't' is integer ms (0, 8, 16, 24...)
+        return [t / 1000.0 for t in traj['t']]
+    elif 'timestamps' in traj:
+        # Old format: 'timestamps' is absolute seconds, convert to relative
+        t0 = traj['timestamps'][0]
+        return [t - t0 for t in traj['timestamps']]
+    else:
+        # Fallback: assume 8ms intervals
+        return [i * 0.008 for i in range(len(traj['x']))]
+
+
+def compute_velocities(x: List[int], y: List[int],
+                       t_sec: List[float]) -> np.ndarray:
     """Compute velocity at each point (px/s)."""
     velocities = [0.0]
     for i in range(1, len(x)):
-        dt = timestamps[i] - timestamps[i-1]
+        dt = t_sec[i] - t_sec[i-1]
         if dt > 0:
             dx = x[i] - x[i-1]
             dy = y[i] - y[i-1]
@@ -103,11 +117,11 @@ def compute_velocities(x: List[float], y: List[float],
 
 
 def compute_accelerations(velocities: np.ndarray,
-                          timestamps: List[float]) -> np.ndarray:
+                          t_sec: List[float]) -> np.ndarray:
     """Compute acceleration at each point (px/s^2)."""
     accelerations = [0.0]
     for i in range(1, len(velocities)):
-        dt = timestamps[i] - timestamps[i-1]
+        dt = t_sec[i] - t_sec[i-1]
         if dt > 0:
             accelerations.append((velocities[i] - velocities[i-1]) / dt)
         else:
@@ -154,7 +168,7 @@ def validate_trajectory(traj: dict, config: ValidationConfig,
                         filename: str) -> ValidationResult:
     """Validate a single trajectory and return detailed results."""
     x, y = traj['x'], traj['y']
-    timestamps = traj['timestamps']
+    t_sec = get_timestamps_sec(traj)  # Handles both old and new format
     target = traj.get('target', [x[-1], y[-1]])
 
     issues = []
@@ -164,13 +178,13 @@ def validate_trajectory(traj: dict, config: ValidationConfig,
     if point_count < config.min_points:
         issues.append(f"Too few points: {point_count} < {config.min_points}")
 
-    duration_ms = (timestamps[-1] - timestamps[0]) * 1000
+    duration_ms = t_sec[-1] * 1000  # Already relative (starts at 0)
     if duration_ms < config.min_duration_ms:
         issues.append(f"Too short: {duration_ms:.0f}ms < {config.min_duration_ms}ms")
 
     # Compute velocities and accelerations
-    velocities = compute_velocities(x, y, timestamps)
-    accelerations = compute_accelerations(velocities, timestamps)
+    velocities = compute_velocities(x, y, t_sec)
+    accelerations = compute_accelerations(velocities, t_sec)
 
     # Velocity checks (average of first/last 3 points)
     start_vel = np.mean(velocities[:3]) if len(velocities) >= 3 else velocities[0]
@@ -181,8 +195,8 @@ def validate_trajectory(traj: dict, config: ValidationConfig,
     if end_vel > config.max_end_velocity:
         issues.append(f"High end velocity: {end_vel:.0f} px/s > {config.max_end_velocity}")
 
-    # Sampling interval checks
-    intervals = np.diff(timestamps) * 1000  # Convert to ms
+    # Sampling interval checks (convert to ms)
+    intervals = np.diff(t_sec) * 1000
     avg_interval = np.mean(intervals)
     min_interval = np.min(intervals)
     max_interval = np.max(intervals)
@@ -235,14 +249,14 @@ def create_trajectory_plot(traj: dict, result: ValidationResult,
                            output_path: Path, config: ValidationConfig) -> None:
     """Create a detailed PNG for a single trajectory."""
     x, y = np.array(traj['x']), np.array(traj['y'])
-    timestamps = np.array(traj['timestamps'])
+    t_sec = get_timestamps_sec(traj)
     target = traj.get('target', [x[-1], y[-1]])
 
-    # Convert timestamps to relative ms
-    t_ms = (timestamps - timestamps[0]) * 1000
+    # Convert to ms for plotting
+    t_ms = np.array(t_sec) * 1000
 
-    velocities = compute_velocities(traj['x'], traj['y'], traj['timestamps'])
-    accelerations = compute_accelerations(velocities, traj['timestamps'])
+    velocities = compute_velocities(traj['x'], traj['y'], t_sec)
+    accelerations = compute_accelerations(velocities, t_sec)
 
     # Create figure with custom layout
     fig = plt.figure(figsize=(14, 8))

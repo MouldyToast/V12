@@ -144,10 +144,12 @@ class RecordingUI:
         anchor_pos = pos          # Position when cursor last moved significantly
         anchor_time = time.perf_counter()
 
-        rec_positions: List[Tuple[float, float]] = []
-        rec_timestamps: List[float] = []
-        rec_target: Tuple[float, float] = (0, 0)
+        rec_x: List[int] = []           # X positions (integer pixels)
+        rec_y: List[int] = []           # Y positions (integer pixels)
+        rec_t: List[int] = []           # Timestamps (ms from start: 0, 8, 16, 24...)
+        rec_target: Tuple[int, int] = (0, 0)
         last_sample_time: float = 0.0
+        sample_count: int = 0           # Count for timestamp calculation
 
         saved_count = 0
         total_points = 0
@@ -175,7 +177,9 @@ class RecordingUI:
                         running = False
                     elif event.key == pygame.K_r:
                         recording = False
-                        rec_positions.clear()
+                        rec_x.clear()
+                        rec_y.clear()
+                        rec_t.clear()
                         trail.clear()
                         pos = tracker.get_pos()
                         anchor_pos = pos
@@ -207,40 +211,45 @@ class RecordingUI:
                 # Waiting to start: need to be in target AND settled
                 if in_target and settled:
                     recording = True
-                    rec_positions = [pos]
-                    rec_timestamps = [now]
+                    sample_count = 0
+                    rec_x = [int(round(pos[0]))]
+                    rec_y = [int(round(pos[1]))]
+                    rec_t = [0]  # First sample at t=0
                     last_sample_time = now
-                    rec_target = target
+                    rec_target = (int(round(target[0])), int(round(target[1])))
                     trail.clear()
                     # Spawn next target
                     target = self._spawn_target(pos, screen_w, screen_h)
-                    print(f"  [START] Recording begun at ({pos[0]:.0f}, {pos[1]:.0f})")
+                    print(f"  [START] Recording begun at ({rec_x[0]}, {rec_y[0]})")
             else:
-                # Recording: sample at 125Hz
+                # Recording: sample at 125Hz (every 8ms)
                 if now - last_sample_time >= self.config.sample_interval:
-                    rec_positions.append(pos)
-                    rec_timestamps.append(now)
+                    sample_count += 1
+                    rec_x.append(int(round(pos[0])))
+                    rec_y.append(int(round(pos[1])))
+                    rec_t.append(sample_count * 8)  # 0, 8, 16, 24, 32...
                     last_sample_time = now
 
                 # Check for end: in target AND settled
                 if in_target and settled:
                     hit_flash = 20
 
-                    if len(rec_positions) >= self.config.min_trajectory_points:
+                    if len(rec_x) >= self.config.min_trajectory_points:
                         self._save_trajectory(
-                            rec_positions, rec_timestamps, rec_target,
+                            rec_x, rec_y, rec_t, rec_target,
                             timestamp, saved_count
                         )
-                        total_points += len(rec_positions)
+                        total_points += len(rec_x)
                         saved_count += 1
-                        duration_ms = (rec_timestamps[-1] - rec_timestamps[0]) * 1000
-                        print(f"  [OK] Trajectory {saved_count}: {len(rec_positions)} pts, {duration_ms:.0f}ms")
+                        print(f"  [OK] Trajectory {saved_count}: {len(rec_x)} pts, {rec_t[-1]}ms")
                     else:
-                        print(f"  [SKIP] Only {len(rec_positions)} pts (need {self.config.min_trajectory_points})")
+                        print(f"  [SKIP] Only {len(rec_x)} pts (need {self.config.min_trajectory_points})")
 
                     # Reset for next
                     recording = False
-                    rec_positions.clear()
+                    rec_x.clear()
+                    rec_y.clear()
+                    rec_t.clear()
                     trail.clear()
                     target = self._spawn_target(pos, screen_w, screen_h)
 
@@ -302,7 +311,7 @@ class RecordingUI:
             screen.blit(help_surf, (screen_w // 2 - help_surf.get_width() // 2, screen_h - 35))
 
             if recording:
-                rec_surf = font_md.render(f"● RECORDING ({len(rec_positions)} pts)",
+                rec_surf = font_md.render(f"● RECORDING ({len(rec_x)} pts)",
                                           True, self.COLORS['warning'])
                 screen.blit(rec_surf, (screen_w // 2 - rec_surf.get_width() // 2, 25))
             elif not recording and in_target:
@@ -334,34 +343,31 @@ class RecordingUI:
         ty = max(margin, min(screen_h - margin, ty))
         return (tx, ty)
 
-    def _save_trajectory(self, positions: List[Tuple[float, float]],
-                         timestamps: List[float],
-                         target: Tuple[float, float],
+    def _save_trajectory(self, x: List[int], y: List[int], t: List[int],
+                         target: Tuple[int, int],
                          session_ts: str, index: int) -> None:
-        xs = [p[0] for p in positions]
-        ys = [p[1] for p in positions]
-
-        ideal_dist = math.sqrt((xs[-1] - xs[0])**2 + (ys[-1] - ys[0])**2)
-        actual_dist = sum(
-            math.sqrt((xs[i+1] - xs[i])**2 + (ys[i+1] - ys[i])**2)
-            for i in range(len(xs) - 1)
-        )
+        """Save trajectory with integer pixel positions and ms timestamps."""
+        ideal_dist = int(round(math.sqrt((x[-1] - x[0])**2 + (y[-1] - y[0])**2)))
+        actual_dist = int(round(sum(
+            math.sqrt((x[i+1] - x[i])**2 + (y[i+1] - y[i])**2)
+            for i in range(len(x) - 1)
+        )))
 
         data = {
-            'x': xs,
-            'y': ys,
-            'timestamps': timestamps,
-            'start': [xs[0], ys[0]],
+            'x': x,                    # Integer pixels
+            'y': y,                    # Integer pixels
+            't': t,                    # Integer ms (0, 8, 16, 24...)
+            'start': [x[0], y[0]],
             'target': list(target),
             'ideal_distance': ideal_dist,
             'actual_distance': actual_dist,
-            'duration_ms': (timestamps[-1] - timestamps[0]) * 1000,
-            'point_count': len(positions),
+            'duration_ms': t[-1],
+            'point_count': len(x),
         }
 
         filename = self.output_dir / f"traj_{session_ts}_{index:04d}.json"
         with open(filename, 'w') as f:
-            json.dump(data, f, indent=2)
+            json.dump(data, f)
 
     def _draw_panel(self, screen, font_lg, font_md, font_sm,
                     elapsed: float, count: int, total_pts: int) -> None:
