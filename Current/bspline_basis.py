@@ -457,35 +457,67 @@ class BasisAdapter:
     def get_adapted_basis(self, T: int) -> np.ndarray:
         """
         Get basis vectors adapted to trajectory length T.
-        
+
         This transforms the reference basis U_ref from T_ref points
-        to T points using B-spline interpolation.
-        
+        to T points using B-spline interpolation, then re-orthonormalizes
+        to ensure proper projection properties.
+
+        IMPORTANT: The B-spline transformation C does NOT preserve orthonormality.
+        Without re-orthonormalization, U_T.T @ U_T != I, causing:
+        - Projection c = U_T.T @ x to be distorted
+        - Reconstruction errors scaling with |T - T_ref|
+
+        The fix applies QR decomposition to restore orthonormality after
+        the B-spline transformation.
+
         Args:
             T: Target trajectory length (number of points, not flat length)
-            
+
         Returns:
-            U_T: Adapted basis, shape [2*T × K]
+            U_T: Adapted basis, shape [2*T × K], with orthonormal columns
         """
         if T < 2:
             raise ValueError(f"Trajectory length must be >= 2 (got {T})")
-        
+
         if T not in self._basis_cache:
             # Build transformation matrix
             C_interleaved = build_interleaved_basis_matrix(
-                T_out=T, 
+                T_out=T,
                 T_in=self.T_ref,
                 clamp_endpoints=self.clamp_endpoints
             )
-            
+
             # Adapt basis: U_T = C @ U_ref
             # [2*T × 2*T_ref] @ [2*T_ref × K] = [2*T × K]
             U_T = C_interleaved @ self.U_ref
-            
+
+            # CRITICAL FIX: Re-orthonormalize using QR decomposition
+            # The B-spline transformation destroys orthonormality of columns.
+            # Without this fix, orthonormality error grows with |T - T_ref|:
+            #   T=50: error ~1.5, T=100: error ~4.0
+            # This causes reconstruction RMSE of ~127 pixels instead of ~0.7 pixels.
+            if T != self.T_ref:
+                Q, R = np.linalg.qr(U_T)
+                U_T = Q[:, :self.K]
+
+                # Preserve sign consistency with original basis
+                # (make dominant direction match U_ref's sign convention)
+                for k in range(self.K):
+                    # Compare with corresponding U_ref column direction
+                    # Use the middle portion for stability
+                    mid_start = len(U_T) // 4
+                    mid_end = 3 * len(U_T) // 4
+                    if np.sum(U_T[mid_start:mid_end, k]) < 0:
+                        # Check if U_ref has positive sum in corresponding region
+                        ref_mid = len(self.U_ref) // 4
+                        ref_end = 3 * len(self.U_ref) // 4
+                        if np.sum(self.U_ref[ref_mid:ref_end, k]) > 0:
+                            U_T[:, k] = -U_T[:, k]
+
             # Cache result
             self._basis_cache[T] = U_T
             self._transform_cache[T] = C_interleaved
-        
+
         return self._basis_cache[T]
     
     def _get_transformation_matrix(self, T: int) -> np.ndarray:

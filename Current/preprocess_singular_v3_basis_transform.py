@@ -961,12 +961,13 @@ def save_all_data(
     full_config = {
         # Core parameters
         **config,
-        
+
         # Computed values
         'K': K,
         'T_ref': T_ref,
         'n_control_points': T_ref,  # Alias for clarity
-        
+        'T_win': T_ref,  # Alias for train_singular_diffusion_v1.py compatibility
+
         # Metadata
         'num_orientations': NUM_ORIENTATIONS,
         'num_distance_groups': NUM_DISTANCE_GROUPS,
