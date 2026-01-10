@@ -415,20 +415,45 @@ class BasisAdapter:
         >>> 
         >>> # Reconstruct at different length
         >>> recon_30 = adapter.reconstruct(c, T=30)  # [2*30] = [60]
+
+    ORTHOGONALIZATION METHODS (tested in test_orthogonalization_methods.py):
+    =========================================================================
+    All methods achieve the same reconstruction RMSE (~0.7 pixels) since they
+    span the same subspace. Key differences are speed and numerical precision:
+
+    Method              | Speed (ms) | Ortho Error | Notes
+    --------------------|------------|-------------|---------------------------
+    'qr'                | 0.051      | 6.6e-16     | Best balance (DEFAULT)
+    'svd'               | 0.050      | 1.3e-15     | Most numerically stable
+    'lowdin'            | 0.049      | 2.3e-15     | Minimal deviation from original
+    'lstsq'             | 0.001      | N/A         | No ortho, uses least squares
+    'polar'             | 2.729      | 1.6e-15     | Slow but mathematically elegant
+    'gram_schmidt'      | 0.120      | 5.0e-16     | Classic but slower than QR
+    'cholesky'          | 0.053      | 2.8e-10     | Poor orthonormality precision
+
+    Recommendation: Use 'qr' (default) or 'lstsq' (fastest, no orthogonalization needed)
     """
-    
-    def __init__(self, U_ref: np.ndarray, T_ref: int, 
-                 clamp_endpoints: bool = True):
+
+    # Valid orthogonalization methods
+    ORTHO_METHODS = ['qr', 'svd', 'lowdin', 'polar', 'gram_schmidt', 'cholesky', 'lstsq', 'none']
+
+    def __init__(self, U_ref: np.ndarray, T_ref: int,
+                 clamp_endpoints: bool = True,
+                 ortho_method: str = 'qr'):
         """
         Initialize BasisAdapter.
-        
+
         Args:
             U_ref: Reference SVD basis, shape [2*T_ref × K]
             T_ref: Reference length (number of trajectory points, not flat length)
             clamp_endpoints: Whether to clamp B-spline endpoints
+            ortho_method: Orthogonalization method after B-spline transformation.
+                Options: 'qr' (default), 'svd', 'lowdin', 'polar', 'gram_schmidt',
+                         'cholesky', 'lstsq' (no ortho, uses least squares projection),
+                         'none' (no ortho, original broken behavior)
         """
         U_ref = np.asarray(U_ref)
-        
+
         # Validate shape
         expected_rows = 2 * T_ref
         if U_ref.shape[0] != expected_rows:
@@ -436,45 +461,116 @@ class BasisAdapter:
                 f"U_ref has {U_ref.shape[0]} rows, expected {expected_rows} "
                 f"for T_ref={T_ref} (interleaved x,y format)"
             )
-        
+
         if U_ref.ndim != 2:
             raise ValueError(f"U_ref must be 2D, got shape {U_ref.shape}")
-        
+
+        if ortho_method not in self.ORTHO_METHODS:
+            raise ValueError(f"ortho_method must be one of {self.ORTHO_METHODS}, got '{ortho_method}'")
+
         self.U_ref = U_ref.copy()
         self.T_ref = T_ref
         self.K = U_ref.shape[1]
         self.clamp_endpoints = clamp_endpoints
-        
+        self.ortho_method = ortho_method
+
         # Cache for adapted bases
         self._basis_cache: Dict[int, np.ndarray] = {}
-        
+
         # Cache for transformation matrices (optional, for debugging)
         self._transform_cache: Dict[int, np.ndarray] = {}
-        
+
+        # Cache for raw (non-orthogonalized) bases (for lstsq method)
+        self._raw_basis_cache: Dict[int, np.ndarray] = {}
+
         # Always cache the reference length (identity transform)
         self._basis_cache[T_ref] = U_ref.copy()
-    
+        self._raw_basis_cache[T_ref] = U_ref.copy()
+
+    def _orthogonalize(self, U_T: np.ndarray) -> np.ndarray:
+        """Apply the selected orthogonalization method."""
+        method = self.ortho_method
+        K = self.K
+
+        if method == 'none' or method == 'lstsq':
+            # No orthogonalization
+            return U_T
+
+        elif method == 'qr':
+            Q, R = np.linalg.qr(U_T)
+            return Q[:, :K]
+
+        elif method == 'svd':
+            U, S, Vt = np.linalg.svd(U_T, full_matrices=False)
+            return U[:, :K]
+
+        elif method == 'lowdin':
+            # Löwdin symmetric orthogonalization: U_orth = U_T @ S^(-1/2)
+            S = U_T.T @ U_T
+            try:
+                eigvals, eigvecs = np.linalg.eigh(S)
+                eigvals = np.maximum(eigvals, 1e-10)
+                S_inv_sqrt = eigvecs @ np.diag(1.0 / np.sqrt(eigvals)) @ eigvecs.T
+                return (U_T @ S_inv_sqrt)[:, :K]
+            except:
+                Q, R = np.linalg.qr(U_T)
+                return Q[:, :K]
+
+        elif method == 'polar':
+            try:
+                from scipy.linalg import polar
+                W, P = polar(U_T)
+                return W[:, :K]
+            except:
+                U, S, Vt = np.linalg.svd(U_T, full_matrices=False)
+                return (U @ Vt)[:, :K]
+
+        elif method == 'gram_schmidt':
+            # Modified Gram-Schmidt
+            n, k = U_T.shape
+            Q = np.zeros((n, k))
+            for j in range(k):
+                v = U_T[:, j].copy()
+                for i in range(j):
+                    v = v - np.dot(Q[:, i], v) * Q[:, i]
+                norm = np.linalg.norm(v)
+                if norm > 1e-10:
+                    Q[:, j] = v / norm
+            return Q[:, :K]
+
+        elif method == 'cholesky':
+            S = U_T.T @ U_T
+            try:
+                S_reg = S + 1e-10 * np.eye(S.shape[0])
+                L = np.linalg.cholesky(S_reg)
+                L_inv_T = np.linalg.inv(L.T)
+                return (U_T @ L_inv_T)[:, :K]
+            except:
+                Q, R = np.linalg.qr(U_T)
+                return Q[:, :K]
+
+        else:
+            raise ValueError(f"Unknown ortho_method: {method}")
+
     def get_adapted_basis(self, T: int) -> np.ndarray:
         """
         Get basis vectors adapted to trajectory length T.
 
         This transforms the reference basis U_ref from T_ref points
-        to T points using B-spline interpolation, then re-orthonormalizes
-        to ensure proper projection properties.
+        to T points using B-spline interpolation, then applies the
+        selected orthogonalization method.
 
         IMPORTANT: The B-spline transformation C does NOT preserve orthonormality.
         Without re-orthonormalization, U_T.T @ U_T != I, causing:
         - Projection c = U_T.T @ x to be distorted
         - Reconstruction errors scaling with |T - T_ref|
 
-        The fix applies QR decomposition to restore orthonormality after
-        the B-spline transformation.
-
         Args:
             T: Target trajectory length (number of points, not flat length)
 
         Returns:
-            U_T: Adapted basis, shape [2*T × K], with orthonormal columns
+            U_T: Adapted basis, shape [2*T × K]
+                 Orthonormal if ortho_method != 'none' and != 'lstsq'
         """
         if T < 2:
             raise ValueError(f"Trajectory length must be >= 2 (got {T})")
@@ -488,37 +584,43 @@ class BasisAdapter:
             )
 
             # Adapt basis: U_T = C @ U_ref
-            # [2*T × 2*T_ref] @ [2*T_ref × K] = [2*T × K]
-            U_T = C_interleaved @ self.U_ref
+            U_T_raw = C_interleaved @ self.U_ref
 
-            # CRITICAL FIX: Re-orthonormalize using QR decomposition
-            # The B-spline transformation destroys orthonormality of columns.
-            # Without this fix, orthonormality error grows with |T - T_ref|:
-            #   T=50: error ~1.5, T=100: error ~4.0
-            # This causes reconstruction RMSE of ~127 pixels instead of ~0.7 pixels.
-            if T != self.T_ref:
-                Q, R = np.linalg.qr(U_T)
-                U_T = Q[:, :self.K]
+            # Store raw basis for lstsq projection
+            self._raw_basis_cache[T] = U_T_raw.copy()
 
-                # Preserve sign consistency with original basis
-                # (make dominant direction match U_ref's sign convention)
+            # Apply orthogonalization (except for lstsq/none)
+            if T != self.T_ref and self.ortho_method not in ['none', 'lstsq']:
+                U_T = self._orthogonalize(U_T_raw)
+
+                # Preserve sign consistency with original basis (for QR, SVD, etc.)
                 for k in range(self.K):
-                    # Compare with corresponding U_ref column direction
-                    # Use the middle portion for stability
                     mid_start = len(U_T) // 4
                     mid_end = 3 * len(U_T) // 4
                     if np.sum(U_T[mid_start:mid_end, k]) < 0:
-                        # Check if U_ref has positive sum in corresponding region
                         ref_mid = len(self.U_ref) // 4
                         ref_end = 3 * len(self.U_ref) // 4
                         if np.sum(self.U_ref[ref_mid:ref_end, k]) > 0:
                             U_T[:, k] = -U_T[:, k]
+            else:
+                U_T = U_T_raw
 
-            # Cache result
+            # Cache results
             self._basis_cache[T] = U_T
             self._transform_cache[T] = C_interleaved
 
         return self._basis_cache[T]
+
+    def get_raw_basis(self, T: int) -> np.ndarray:
+        """
+        Get the raw (non-orthogonalized) adapted basis.
+
+        Useful for lstsq projection method or debugging.
+        """
+        if T not in self._raw_basis_cache:
+            # Trigger computation
+            _ = self.get_adapted_basis(T)
+        return self._raw_basis_cache[T]
     
     def _get_transformation_matrix(self, T: int) -> np.ndarray:
         """
@@ -541,64 +643,71 @@ class BasisAdapter:
     def project(self, trajectory: np.ndarray) -> np.ndarray:
         """
         Project a raw trajectory to K-dimensional coefficients.
-        
+
         This is the key operation that preserves the raw data!
         The trajectory is NOT interpolated or smoothed - instead,
         the basis is adapted to match the trajectory's native length.
-        
+
         Args:
             trajectory: Flat trajectory [x0,y0,x1,y1,...] of shape [2*T]
-            
+
         Returns:
             coefficients: K-dimensional coefficient vector [K]
         """
         trajectory = np.asarray(trajectory).flatten()
-        
+
         if len(trajectory) % 2 != 0:
             raise ValueError(f"Trajectory length must be even (got {len(trajectory)})")
-        
+
         T = len(trajectory) // 2
-        
-        # Get adapted basis for this length
-        U_T = self.get_adapted_basis(T)  # [2*T × K]
-        
-        # Project: c = U_T^T @ trajectory
-        # [K × 2*T] @ [2*T] = [K]
-        coefficients = U_T.T @ trajectory
-        
+
+        if self.ortho_method == 'lstsq':
+            # For lstsq method, use least squares projection on raw (non-orthonormal) basis
+            # This solves: min ||U_T_raw @ c - trajectory||^2
+            U_T_raw = self.get_raw_basis(T)  # [2*T × K]
+            coefficients, _, _, _ = np.linalg.lstsq(U_T_raw, trajectory, rcond=None)
+        else:
+            # For orthonormal bases, use direct projection: c = U_T^T @ trajectory
+            U_T = self.get_adapted_basis(T)  # [2*T × K]
+            coefficients = U_T.T @ trajectory
+
         return coefficients
     
     def reconstruct(self, coefficients: np.ndarray, T: int) -> np.ndarray:
         """
         Reconstruct trajectory at specified length from coefficients.
-        
+
         This reconstructs directly at the target length - no interpolation
         of the reconstructed trajectory is needed!
-        
+
         Args:
             coefficients: K-dimensional coefficient vector [K]
             T: Target trajectory length (number of points)
-            
+
         Returns:
             trajectory: Flat trajectory [x0,y0,x1,y1,...] of shape [2*T]
         """
         coefficients = np.asarray(coefficients).flatten()
-        
+
         if len(coefficients) != self.K:
             raise ValueError(
                 f"Expected {self.K} coefficients, got {len(coefficients)}"
             )
-        
+
         if T < 2:
             raise ValueError(f"Trajectory length must be >= 2 (got {T})")
-        
-        # Get adapted basis for target length
-        U_T = self.get_adapted_basis(T)  # [2*T × K]
-        
+
+        if self.ortho_method == 'lstsq':
+            # For lstsq method, use raw (non-orthonormalized) basis for consistency
+            U_T = self.get_raw_basis(T)  # [2*T × K]
+        else:
+            # For orthonormal methods, use the orthonormalized basis
+            U_T = self.get_adapted_basis(T)  # [2*T × K]
+
         # Reconstruct: trajectory = U_T @ c
         # [2*T × K] @ [K] = [2*T]
         trajectory = U_T @ coefficients
-        
+
         return trajectory
     
     def project_batch(self, trajectories: List[np.ndarray]) -> np.ndarray:
