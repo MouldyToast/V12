@@ -1,0 +1,516 @@
+For each trajectory of length T: interpolate data to T_win
+Stack all canonical trajectories into matrix A [2*T_win × N]
+SVD(A) → U_k [2*T_win × K]
+Project: c = U_k.T @ canonical_trajectory
+Reconstruct: recon = U_k @ c → 2*T_win points
+Interpolate reconstruction back to desired length
+
+Paper's approach:
+
+Keep raw trajectories at their original lengths
+Learn an SVD basis on some reference representation
+For trajectory of length T: build B-spline matrix C_T [T × T_ref]
+Adapted basis: V_T = C_T @ V_ref
+Project RAW data: c = raw_trajectory @ V_T
+Reconstruct: recon = V_T @ c → T points (native length!)
+
+The challenge: How do you do SVD when trajectories have different lengths?
+Looking at this more carefully, I think the paper's approach might be:
+
+Use B-spline basis functions directly, not as an interpolation tool
+Each trajectory of length T is projected onto B-spline basis functions of that length
+The coefficients represent the trajectory in a length-invariant space
+SVD is then done on these B-spline coefficients
+
+Or alternatively:
+
+Pad/truncate trajectories to max length
+Use a mask to handle variable lengths
+Do SVD on the masked data
+
+Actually, let me think about this more carefully. The paper mentions:
+C_T = B-spline transformation matrix
+v_interpolated = C_T × v_k        # Transform BASIS VECTORS
+X_projected = X × C_T × V_K       # Project using transformed basis
+So V_K is a [T_ref × K] matrix - the SVD basis vectors learned at reference length. C_T is a [T × T_ref] matrix that adapts from reference to actual length. This means the basis vectors themselves get transformed via B-splines to match each trajectory's length, then the raw T-length trajectory projects directly onto these adapted basis vectors.
+The main challenge is determining how to construct V_K in the first place - whether using trajectories at the reference length or through some other initialization method. Once that's established, the projection and reconstruction pipeline becomes straightforward: adapt the basis for the given length, then project the trajectory onto it.
+Now I have a complete picture. Let me create a comprehensive implementation plan.
+
+Comprehensive Plan: Basis-Transformation Approach
+Executive Summary
+We're changing from "transform data to match basis" to "transform basis to match data".
+CURRENT (V2):     raw_data ──[B-spline]──► canonical_data ──[SVD]──► coefficients
+                                                              │
+                                                              ▼
+                  output ◄──[B-spline]──── reconstruction ◄──[SVD⁻¹]
+
+PROPOSED (V3):    raw_data ──[project onto adapted basis]──► coefficients
+                      ▲                                           │
+                      │                                           ▼
+                  output ◄──[reconstruct from adapted basis]──────┘
+
+Phase 0: Mathematical Foundation
+Understanding the Paper's Approach
+Core Insight: B-spline matrices can transform basis vectors, not just data.
+The Math:
+Given:
+  V_ref = [T_ref × K]    SVD basis learned at reference length T_ref
+  
+For trajectory of length T:
+  C_T = [T × T_ref]      B-spline matrix that maps T_ref → T
+  
+Adapted basis:
+  V_T = C_T @ V_ref      [T × K] basis vectors adapted to length T
+  
+Projection (raw data preserved!):
+  c = X_raw @ V_T        [1 × K] coefficients
+  
+Reconstruction:
+  X_recon = V_T @ c      [T × 1] at native length!
+Why this preserves information:
+┌────────────────────────────────────────────────────────────────┐
+│  The B-spline transformation:                                  │
+│    • Stretches/compresses the BASIS VECTORS                    │
+│    • Raw data stays exactly as recorded                        │
+│    • Jitter, micro-corrections, timing: ALL PRESERVED          │
+│                                                                │
+│  What you're asking the SVD:                                   │
+│    "What combination of (length-adapted) basis vectors         │
+│     best represents THIS exact trajectory?"                    │
+│                                                                │
+│  NOT:                                                          │
+│    "What combination represents this smoothed, resampled,      │
+│     canonical-length approximation of the trajectory?"         │
+└────────────────────────────────────────────────────────────────┘
+
+Phase 1: New B-Spline Infrastructure
+File: bspline_basis.py (NEW)
+This extends bspline.py with basis-transformation capabilities.
+Key Functions:
+pythondef build_basis_transform_matrix(T_actual: int, T_ref: int) -> np.ndarray:
+    """
+    Build matrix that transforms basis vectors from T_ref to T_actual.
+    
+    Returns C such that: V_adapted = C @ V_ref
+    
+    Args:
+        T_actual: Length of the actual trajectory
+        T_ref: Reference length the SVD basis was learned at
+        
+    Returns:
+        C: [T_actual × T_ref] transformation matrix
+    """
+    # This is essentially the same as build_bspline_matrix
+    # but with different semantics: we're transforming basis, not data
+    pass
+
+
+class BasisAdapter:
+    """
+    Adapts SVD basis vectors to arbitrary trajectory lengths.
+    
+    Core component of the paper's approach.
+    """
+    
+    def __init__(self, V_ref: np.ndarray, T_ref: int):
+        """
+        Args:
+            V_ref: [T_ref × K] or [2*T_ref × K] reference basis
+            T_ref: Reference length
+        """
+        self.V_ref = V_ref
+        self.T_ref = T_ref
+        self.K = V_ref.shape[1]
+        self._cache = {}  # Cache adapted bases
+    
+    def get_adapted_basis(self, T: int) -> np.ndarray:
+        """Get basis vectors adapted to length T."""
+        if T not in self._cache:
+            C_T = build_basis_transform_matrix(T, self.T_ref)
+            # Handle x,y interleaving
+            V_T = self._adapt_interleaved(C_T)
+            self._cache[T] = V_T
+        return self._cache[T]
+    
+    def project(self, trajectory: np.ndarray) -> np.ndarray:
+        """Project raw trajectory to K-dimensional coefficients."""
+        T = len(trajectory) // 2  # Assuming interleaved x,y
+        V_T = self.get_adapted_basis(T)
+        return trajectory @ V_T  # [2T] @ [2T × K] = [K]
+    
+    def reconstruct(self, coefficients: np.ndarray, T: int) -> np.ndarray:
+        """Reconstruct trajectory at length T from coefficients."""
+        V_T = self.get_adapted_basis(T)
+        return V_T @ coefficients  # [2T × K] @ [K] = [2T]
+Design Decision: How to Handle x,y Interleaving
+The basis needs to handle interleaved coordinates [x₀,y₀,x₁,y₁,...]:
+pythondef _adapt_interleaved(self, C_T: np.ndarray) -> np.ndarray:
+    """
+    Adapt basis for interleaved x,y format.
+    
+    If V_ref is [2*T_ref × K], we need to apply C_T separately
+    to x and y components.
+    
+    C_T is [T_actual × T_ref]
+    V_ref is [2*T_ref × K]
+    
+    Output should be [2*T_actual × K]
+    """
+    T_actual = C_T.shape[0]
+    
+    # Build block-diagonal transform for interleaved format
+    # [C_T   0  ]
+    # [0    C_T ]  but interleaved
+    
+    C_interleaved = np.zeros((2 * T_actual, 2 * self.T_ref))
+    
+    # x coordinates: rows 0,2,4,... cols 0,2,4,...
+    for i in range(T_actual):
+        for j in range(self.T_ref):
+            C_interleaved[2*i, 2*j] = C_T[i, j]      # x
+            C_interleaved[2*i+1, 2*j+1] = C_T[i, j]  # y
+    
+    return C_interleaved @ self.V_ref
+```
+
+---
+
+## Phase 2: Learning the Reference Basis
+
+### The Challenge
+
+We can't do standard SVD on variable-length trajectories directly. Options:
+
+**Option A: Learn on a reference subset**
+```
+1. Select trajectories near a reference length (e.g., T_ref = 64)
+2. Do SVD on just these trajectories
+3. Use the resulting V_ref for all lengths via adaptation
+```
+
+**Option B: Two-stage approach**
+```
+1. Project all trajectories onto B-spline basis (fixed # of control points)
+2. Do SVD on the B-spline control points
+3. This gives a length-invariant representation
+```
+
+**Option C: Padded SVD with masking** (more complex)
+```
+1. Pad all trajectories to max length
+2. Use weighted SVD that ignores padded regions
+Recommended: Option B (Two-Stage)
+This is closest to what the paper describes:
+pythondef learn_reference_basis(trajectories: List[np.ndarray], 
+                          n_control_points: int = 16,
+                          K: int = 10) -> Tuple[np.ndarray, int]:
+    """
+    Learn SVD basis via B-spline control points.
+    
+    Stage 1: Each trajectory → B-spline control points (fixed size)
+    Stage 2: SVD on control points → reference basis
+    
+    Args:
+        trajectories: List of variable-length trajectories
+        n_control_points: Number of B-spline control points
+        K: Number of singular vectors to keep
+        
+    Returns:
+        V_ref: [2*n_control_points × K] reference basis
+        T_ref: Reference length (= n_control_points)
+    """
+    N = len(trajectories)
+    T_ref = n_control_points
+    
+    # Stage 1: Fit B-spline control points to each trajectory
+    control_points = np.zeros((N, 2 * T_ref))
+    
+    for i, traj in enumerate(trajectories):
+        T = len(traj) // 2
+        # Fit control points that best represent this trajectory
+        cp = fit_bspline_control_points(traj, n_control_points)
+        control_points[i] = cp
+    
+    # Stage 2: SVD on control points
+    # Center the data
+    mean = control_points.mean(axis=0)
+    centered = control_points - mean
+    
+    # SVD
+    U, S, Vt = np.linalg.svd(centered.T, full_matrices=False)
+    
+    V_ref = U[:, :K]  # [2*T_ref × K]
+    
+    return V_ref, T_ref, mean
+```
+
+---
+
+## Phase 3: New Preprocessing Pipeline
+
+### File: `preprocess_singular_v3_basis_transform.py` (NEW)
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                    V3 PREPROCESSING PIPELINE                         │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  STEP 1: Load raw trajectories                                       │
+│          Keep original lengths!                                      │
+│          NO interpolation to canonical length                        │
+│                                                                      │
+│  STEP 2: Learn reference basis                                       │
+│          - Fit B-spline control points to each trajectory            │
+│          - SVD on control points → V_ref [2*T_ref × K]               │
+│                                                                      │
+│  STEP 3: Project all trajectories using adapted basis                │
+│          For each trajectory of length T:                            │
+│            V_T = adapt_basis(V_ref, T)                               │
+│            c = project(raw_trajectory, V_T)                          │
+│                                                                      │
+│  STEP 4: Generate group anchors                                      │
+│          K-means on coefficients (same as before)                    │
+│                                                                      │
+│  STEP 5: Compute residuals                                           │
+│          residual = coefficient - nearest_anchor                     │
+│                                                                      │
+│  STEP 6: Save everything                                             │
+│          - V_ref (reference basis)                                   │
+│          - T_ref (reference length)                                  │
+│          - original_lengths (CRITICAL: needed for reconstruction!)   │
+│          - coefficients, residuals, anchors                          │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### Key Differences from V2
+
+| Aspect | V2 (Current) | V3 (Proposed) |
+|--------|--------------|---------------|
+| Data transformation | Interpolate to T_win | Keep original |
+| Basis | Fixed [2*T_win × K] | Adapted per trajectory |
+| Length encoding | Extra dimension in K-space | Stored separately, used for basis adaptation |
+| SVD input | Canonical trajectories | B-spline control points |
+| Reconstruction | Fixed length → interpolate | Native length directly |
+
+### Output Structure
+```
+processed_singular_v3/
+├── V_ref.npy              # [2*T_ref × K] reference basis
+├── mean.npy               # [2*T_ref] mean of control points
+├── config.npy             # T_ref, K, etc.
+├── group_anchors.npy      # Same as before
+└── train/val/test/
+    ├── coefficients.npy   # [N × K] - same as before
+    ├── residuals.npy      # [N × K] - same as before
+    ├── original_lengths.npy  # [N] - CRITICAL: actual trajectory lengths
+    ├── orientation_ids.npy
+    └── distance_ids.npy
+
+Phase 4: Updated Training Pipeline
+Minimal Changes Required
+The diffusion model architecture stays mostly the same! It still:
+
+Takes K-dimensional residuals
+Conditions on orientation, distance, anchor
+Predicts noise
+
+Key Insight: The diffusion model operates in K-space, which is the same regardless of how we got there.
+Changes Needed
+
+Dataset needs to store original_lengths:
+
+pythonclass SingularTrajectoryDatasetV3(SingularTrajectoryDataset):
+    def __init__(self, data_dir, split='train', device='cuda'):
+        super().__init__(data_dir, split, device)
+        
+        # V3: original_lengths are REQUIRED (not optional)
+        self.original_lengths = torch.tensor(
+            np.load(split_dir / 'original_lengths.npy'),
+            dtype=torch.long, device=device
+        )
+
+Training loop unchanged - diffusion happens in K-space
+
+
+Phase 5: Updated Generation Pipeline
+File: generate_trajectory_v3.py (NEW)
+This is where the real change happens:
+pythonclass TrajectoryGeneratorV3:
+    def __init__(self, checkpoint_path, data_dir, device='cuda'):
+        # Load model (same as before)
+        # Load V_ref, T_ref (NEW)
+        # Create BasisAdapter (NEW)
+        
+        self.basis_adapter = BasisAdapter(V_ref, T_ref)
+    
+    def generate_single(self, orient_id, dist_id, target_length=None):
+        """
+        Generate trajectory with NATIVE length preservation.
+        
+        Key difference: We specify the output length BEFORE reconstruction,
+        and the basis adapts to that length.
+        """
+        # 1. Get anchor and generate residual via diffusion (same as before)
+        anchor = self.get_anchor(orient_id, dist_id)
+        r_0 = self.denoise(anchor, orient_id, dist_id)
+        
+        # 2. Compute coefficients
+        c = anchor + r_0  # [K]
+        
+        # 3. Determine output length
+        if target_length is None:
+            # Could sample from length distribution for this group
+            target_length = self.sample_length(orient_id, dist_id)
+        
+        # 4. Reconstruct at NATIVE length using adapted basis
+        # THIS IS THE KEY DIFFERENCE!
+        trajectory = self.basis_adapter.reconstruct(c, target_length)
+        
+        # NO interpolation step! Output is directly at target_length.
+        
+        return trajectory
+```
+
+### Comparison: V2 vs V3 Generation
+```
+V2 Generation:
+─────────────
+coefficients ──► U_k @ c ──► recon[:-1] ──► [2*T_win] canonical
+                                                │
+                            B-spline interpolate to decoded_length
+                                                │
+                                                ▼
+                                          output trajectory
+                                          
+V3 Generation:
+─────────────
+coefficients ──► V_T @ c ──► output trajectory at length T
+                   ▲
+                   │
+            adapted basis V_T = adapt(V_ref, T)
+            
+No interpolation! Raw output at desired length.
+
+Phase 6: Length Handling Strategy
+The Question: How do we know what length to generate?
+Option A: Length distribution per group
+python# During preprocessing, compute length statistics per group
+group_length_stats = {
+    (dist_id, orient_id): {
+        'mean': 45.2,
+        'std': 12.3,
+        'min': 25,
+        'max': 80,
+        'histogram': [...],
+    }
+}
+
+# At generation time, sample from the distribution
+length = sample_from_group_distribution(orient_id, dist_id)
+Option B: Length as explicit input
+python# User specifies desired length
+trajectory = generator.generate(orient_id="N", dist_id="Medium", length=50)
+Option C: Hybrid - encode length tendency in coefficients
+python# Learn correlation between coefficients and length
+# Use regression to predict "natural" length from generated coefficients
+predicted_length = predict_length_from_coefficients(c)
+Recommendation: Option A with Option B override
+Store length distributions per group, sample from them by default, but allow explicit override.
+
+Phase 7: Validation & Testing
+Test 1: Round-Trip Reconstruction
+pythondef test_roundtrip(trajectory, basis_adapter):
+    """Verify: project → reconstruct preserves trajectory."""
+    T = len(trajectory) // 2
+    
+    # Project
+    c = basis_adapter.project(trajectory)
+    
+    # Reconstruct at SAME length
+    recon = basis_adapter.reconstruct(c, T)
+    
+    # Compare
+    error = np.mean(np.abs(trajectory - recon))
+    correlation = np.corrcoef(trajectory, recon)[0, 1]
+    
+    return error, correlation
+Test 2: Jitter Preservation
+pythondef test_jitter_preservation(raw_trajectory, basis_adapter):
+    """Verify: high-frequency components are preserved."""
+    # Compute jitter in original
+    original_jitter = compute_jitter(raw_trajectory)
+    
+    # Round-trip through projection
+    c = basis_adapter.project(raw_trajectory)
+    recon = basis_adapter.reconstruct(c, len(raw_trajectory) // 2)
+    recon_jitter = compute_jitter(recon)
+    
+    # Compare jitter magnitude
+    jitter_ratio = recon_jitter / original_jitter
+    
+    return jitter_ratio  # Should be close to 1.0
+Test 3: Length-Invariant Coefficients
+pythondef test_length_invariance(trajectory, basis_adapter):
+    """Verify: same trajectory at different capture rates → similar coefficients."""
+    T = len(trajectory) // 2
+    
+    # Project at native length
+    c_native = basis_adapter.project(trajectory)
+    
+    # Manually subsample (simulating different capture rate)
+    subsampled = trajectory[::2]  # Half the points
+    c_subsampled = basis_adapter.project(subsampled)
+    
+    # Coefficients should be similar (representing same motion)
+    similarity = np.corrcoef(c_native, c_subsampled)[0, 1]
+    
+    return similarity  # Should be high
+
+Implementation Order
+Week 1: Foundation
+
+✅ Understand current system (done)
+⬜ Implement bspline_basis.py with BasisAdapter
+⬜ Write tests for basis adaptation
+⬜ Implement fit_bspline_control_points()
+
+Week 2: Preprocessing
+
+⬜ Implement learn_reference_basis()
+⬜ Create preprocess_singular_v3_basis_transform.py
+⬜ Run preprocessing on your data
+⬜ Validate: reconstruction error, jitter preservation
+
+Week 3: Training & Generation
+
+⬜ Update dataset class for V3 format
+⬜ Verify training works (should need minimal changes)
+⬜ Create generate_trajectory_v3.py
+⬜ Implement length sampling strategy
+
+Week 4: Evaluation & Tuning
+
+⬜ Compare V2 vs V3 outputs visually
+⬜ Quantitative jitter analysis
+⬜ Tune T_ref and K
+⬜ Update visualization tools
+
+
+Key Parameters to Tune
+ParameterDescriptionSuggested RangeT_refReference length for basis16-32 control pointsKSingular dimensions4-12 (paper uses 4!)n_control_pointsB-spline control pointsSame as T_ref
+Critical insight from paper: K=4 is optimal. Your current K=10-40 may be too high. The basis-transformation approach might work better with lower K because you're not trying to capture noise that was smoothed away.
+
+Summary: What Changes, What Stays
+Changes
+
+B-spline transforms basis, not data
+Raw trajectories preserved through pipeline
+Length stored explicitly, used for basis adaptation
+Generation specifies length upfront, no post-hoc interpolation
+
+Stays the Same
+
+Diffusion model architecture (operates in K-space)
+Anchor-based residual approach
+Group conditioning (orientation × distance)
+Training loop mechanics
