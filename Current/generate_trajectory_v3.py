@@ -25,16 +25,15 @@ Generation Process:
 
 Usage:
     # Generate for specific group
-    python generate_trajectory_v3.py --checkpoint checkpoints/best_model.pt \\
-        --data processed_v3/ --orient N --dist Medium --visualize
+    python generate_trajectory_v3.py --checkpoint checkpoints/best_model.pt --data processed_v3/ --orient N --dist Medium --visualize
     
     # Generate for all groups
-    python generate_trajectory_v3.py --checkpoint checkpoints/best_model.pt \\
-        --data processed_v3/ --all_groups --visualize --samples 20
+
+    python generate_trajectory_v3.py --checkpoint checkpoints/best_model.pt --data processed_v3/ --all_groups --visualize --samples 20
     
     # Generate with specific length
-    python generate_trajectory_v3.py --checkpoint checkpoints/best_model.pt \\
-        --data processed_v3/ --orient E --dist Large --length 80
+
+    python generate_trajectory_v3.py --checkpoint checkpoints/best_model.pt --data processed_v3/ --orient E --dist Large --length 80
 """
 
 import numpy as np
@@ -195,7 +194,7 @@ class TrajectoryGeneratorV3:
             return length
         else:
             # Fallback: use reasonable defaults based on distance group
-            defaults = {0: 30, 1: 45, 2: 60, 3: 80, 4: 100}  # XSmall to XLarge
+            defaults = {0: 20, 1: 45, 2: 60, 3: 80, 4: 158}  # XSmall to XLarge
             return defaults.get(dist_id, 60)
     
     @torch.no_grad()
