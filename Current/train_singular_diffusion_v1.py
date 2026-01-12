@@ -23,8 +23,11 @@ Key Innovation (from SingularTrajectory):
     - Only M=10 diffusion steps needed
 
 Usage:
+
+    ############# ORIGINAL VERSION  ##########
     python train_singular_diffusion_v1.py --data processed_v3/ --epochs 256
-    
+
+
     # Resume training
     python train_singular_diffusion_v1.py --data processed_singular/ --resume checkpoints/latest.pt
 """
@@ -49,17 +52,17 @@ from tqdm import tqdm
 DEFAULT_CONFIG = {
     # Model
     'hidden_dim': 256,
-    'num_layers': 8,
+    'num_layers': 4,
     'dropout': 0.1,
     
     # Diffusion
-    'diffusion_steps': 10,     # M (small because anchor-based!)
+    'diffusion_steps': 2, #WAS 10      # M (small because anchor-based!)
     'beta_start': 0.0001,
     'beta_end': 0.02,
     
     # Training
     'batch_size': 128,
-    'learning_rate': 1e-3,
+    'learning_rate': 1e-3,# 3e-4
     'weight_decay': 1e-4,
     'epochs': 256,
     'warmup_epochs': 10,
