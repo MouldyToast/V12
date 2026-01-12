@@ -25,15 +25,15 @@ Generation Process:
 
 Usage:
     # Generate for specific group
-    python generate_trajectory_v3.py --checkpoint checkpoints/best_model.pt --data processed_v3/ --orient N --dist Medium --visualize
+    python generate_trajectory_v3.py --checkpoint checkpoints/best_model.pt \\
+        --data processed_v3/ --orient N --dist Medium --visualize
     
     # Generate for all groups
-
     python generate_trajectory_v3.py --checkpoint checkpoints/best_model.pt --data processed_v3/ --all_groups --visualize --samples 20
     
     # Generate with specific length
-
-    python generate_trajectory_v3.py --checkpoint checkpoints/best_model.pt --data processed_v3/ --orient E --dist Large --length 80
+    python generate_trajectory_v3.py --checkpoint checkpoints/best_model.pt \\
+        --data processed_v3/ --orient E --dist Large --length 80
 """
 
 import numpy as np
@@ -47,7 +47,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 from train_singular_diffusion_v1 import ResidualDiffusionMLP, NoiseSchedule
-from bspline_basis import BasisAdapter
+from bspline_basis import BasisAdapter, build_interleaved_basis_matrix
 
 
 # =============================================================================
@@ -84,6 +84,9 @@ class TrajectoryGeneratorV3:
         self.K = self.config['K']
         self.T_ref = self.config.get('T_ref', self.config.get('n_control_points', 64))
         self.version = self.config.get('version', 'unknown')
+
+
+
         
         # Verify V3 format
         if 'v3' not in self.version.lower() and not self.config.get('uses_basis_adaptation', False):
@@ -154,6 +157,10 @@ class TrajectoryGeneratorV3:
         print(f"\nLoaded model from {checkpoint_path}")
         print(f"  K={self.K}, T_ref={self.T_ref}, diffusion_steps={self.num_steps}")
         print(f"  Version: {self.version}")
+
+
+
+        print(f"DEBUG anchors sample: {list(self.group_anchors.values())[0][0][:3]}")
     
     def get_anchor(self, orient_id: int, dist_id: int, anchor_idx: Optional[int] = None) -> torch.Tensor:
         """Get anchor prototype for a group."""
@@ -194,7 +201,7 @@ class TrajectoryGeneratorV3:
             return length
         else:
             # Fallback: use reasonable defaults based on distance group
-            defaults = {0: 20, 1: 45, 2: 60, 3: 80, 4: 158}  # XSmall to XLarge
+            defaults = {0: 30, 1: 45, 2: 60, 3: 80, 4: 100}  # XSmall to XLarge
             return defaults.get(dist_id, 60)
     
     @torch.no_grad()
@@ -256,15 +263,17 @@ class TrajectoryGeneratorV3:
         
         # Add anchor to get coefficients
         coefficients = (anchor.squeeze(0) + r_0).cpu().numpy()  # [K]
-        
-        # === V3 KEY DIFFERENCE ===
-        # Reconstruct directly at target length using adapted basis
-        trajectory_flat = self.adapter.reconstruct(coefficients, target_length)
-        
-        # If we have a mean, we need to add it back (adapted to target length)
+        # === FIXED RECONSTRUCTION ===
+        # Reconstruct via control points (consistent with fixed preprocessing)
+        # Step 1: Reconstruct control points in U_ref space
+        cp_recon = self.U_ref @ coefficients
         if self.mean is not None:
-            mean_adapted = self.adapter.reconstruct_mean(self.mean, target_length)
-            trajectory_flat = trajectory_flat + mean_adapted
+            cp_recon = cp_recon + self.mean
+
+        # Step 2: Interpolate control points to target trajectory length
+        C = build_interleaved_basis_matrix(target_length, self.T_ref)
+        trajectory_flat = C @ cp_recon
+
         
         # Reshape to [T, 2]
         trajectory = np.column_stack([
@@ -338,19 +347,23 @@ class TrajectoryGeneratorV3:
         # Coefficients
         coefficients = (anchors + r_t).cpu().numpy()  # [B, K]
         
-        # Reconstruct each trajectory at its target length
+        # FIXED: Reconstruct each trajectory via control points
         trajectories = []
         for i in range(B):
             T = target_lengths[i]
-            traj_flat = self.adapter.reconstruct(coefficients[i], T)
-            
+
+            # Step 1: Reconstruct control points
+            cp_recon = self.U_ref @ coefficients[i]
             if self.mean is not None:
-                mean_adapted = self.adapter.reconstruct_mean(self.mean, T)
-                traj_flat = traj_flat + mean_adapted
-            
+                cp_recon = cp_recon + self.mean
+
+            # Step 2: Interpolate to target length
+            C = build_interleaved_basis_matrix(T, self.T_ref)
+            traj_flat = C @ cp_recon
+
             traj = np.column_stack([traj_flat[0::2], traj_flat[1::2]])
             trajectories.append(traj)
-        
+
         return trajectories, target_lengths
     
     def generate_for_all_groups(self, samples_per_group: int = 10) -> Dict:
@@ -416,6 +429,7 @@ def visualize_single_trajectory(
     ax.set_ylabel('Y (pixels)')
     ax.legend()
     ax.set_aspect('equal')
+    ax.invert_yaxis()
     ax.grid(True, alpha=0.3)
     ax.axhline(0, color='gray', linewidth=0.5)
     ax.axvline(0, color='gray', linewidth=0.5)
@@ -459,6 +473,7 @@ def visualize_all_groups(
             mean_len = np.mean(lengths)
             ax.set_title(f'{dist_name}-{orient_name}\n(L≈{mean_len:.0f})', fontsize=9)
             ax.set_aspect('equal')
+            ax.invert_yaxis()
             ax.grid(True, alpha=0.3)
             ax.axhline(0, color='gray', linewidth=0.5)
             ax.axvline(0, color='gray', linewidth=0.5)
@@ -526,6 +541,7 @@ def visualize_length_comparison(
         
         ax.set_title(f'Length = {T}', fontsize=12)
         ax.set_aspect('equal')
+        ax.invert_yaxis()
         ax.grid(True, alpha=0.3)
     
     group_name = f"{DISTANCE_GROUPS[dist_id]}-{ORIENTATIONS[orient_id]}"
