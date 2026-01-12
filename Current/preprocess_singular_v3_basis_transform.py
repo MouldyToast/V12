@@ -73,6 +73,7 @@ from bspline_basis import (
     learn_reference_basis,
     fit_bspline_control_points,
     evaluate_control_point_fit,
+    build_interleaved_basis_matrix, 
 )
 
 
@@ -82,14 +83,14 @@ from bspline_basis import (
 
 DEFAULT_CONFIG = {
     # Core parameters - NOTE: Aligned with paper's recommendations
-    'K': 8,                     # Singular space dimensions (paper uses K=4)
-    'n_control_points': 20,     # B-spline control points (= T_ref)
-    'anchors_per_group': 6,     # Anchors per (distance, orientation) group
+    'K': 30,                     # Singular space dimensions (paper uses K=4)
+    'n_control_points': 15,     # B-spline control points (= T_ref)
+    'anchors_per_group': 15,     # Anchors per (distance, orientation) group
     'random_seed': 42,
     
     # Length constraints
     'min_length': 20,           # Minimum trajectory length (points)
-    'max_length_filter': 200,   # Maximum trajectory length (filter out longer)
+    'max_length_filter': 160,   # Maximum trajectory length (filter out longer)
     
     # Trajectory filtering
     'max_distance_ratio': 1.6,  # actual_distance / ideal_distance threshold
@@ -144,7 +145,7 @@ def get_orientation_id(x: np.ndarray, y: np.ndarray) -> int:
     Uses screen coordinates where Y increases downward.
     """
     dx = x[-1] - x[0]
-    dy = y[0] - y[-1]  # Flip for screen coords
+    dy = y[-1] - y[0]  # Flip for screen coords
     
     if abs(dx) < 1e-6 and abs(dy) < 1e-6:
         return 2  # Default to E for zero-length
@@ -468,112 +469,103 @@ def project_trajectories(
 ) -> Tuple[np.ndarray, BasisAdapter, Dict]:
     """
     Project all trajectories to K-dimensional coefficient space.
-    
-    CRITICAL V3 DIFFERENCE:
-    - Each trajectory is projected using a BASIS adapted to its length
-    - The raw trajectory data is PRESERVED (no interpolation!)
-    - This is where jitter/micro-corrections are maintained
-    
-    Process for each trajectory:
-        1. Get adapted basis U_T for trajectory length T
-        2. If centering: subtract mean from control point representation
-        3. Project: c = U_T.T @ (trajectory - mean_adapted)
-        
-    Note: The mean subtraction is tricky because mean is in control point space.
-    We handle this by projecting through the adapted basis.
-    
-    Args:
-        trajectories: List of trajectory dicts with 'flat' and 'length' keys
-        U_ref: Reference basis [2*T_ref × K]
-        T_ref: Reference length
-        mean: Mean control points [2*T_ref] or None
-        
-    Returns:
-        coefficients: [N × K] array
-        adapter: BasisAdapter instance for later use
-        stats: Projection statistics
+
+    FIXED VERSION: Projects via CONTROL POINTS, not raw trajectories.
+
+    The key insight is that U_ref was learned from control points,
+    so we must project in control point space for mathematical consistency:
+
+        c = U_ref.T @ (control_points - mean)
+
+    NOT the buggy version which did:
+
+        c = U_T.T @ raw_trajectory  (WRONG - different spaces!)
     """
-    print_section("STEP 3: Projecting Trajectories to K-Space")
-    
+    print_section("STEP 3: Projecting Trajectories to K-Space (FIXED)")
+
     N = len(trajectories)
     K = U_ref.shape[1]
-    
+
     print(f"Projecting {N} trajectories to {K}-dimensional space...")
-    print(f"  Using basis adaptation (V3 approach)")
-    
-    # Create basis adapter
+    print(f"  Using FIXED control point projection")
+
+    # Create basis adapter (still needed for reconstruction)
     adapter = BasisAdapter(U_ref, T_ref)
-    
+
     # Project all trajectories
     coefficients = np.zeros((N, K), dtype=np.float64)
     projection_errors = []
-    
-    # Group trajectories by length for efficiency (cache reuse)
-    length_groups = defaultdict(list)
-    for i, traj in enumerate(trajectories):
-        length_groups[traj['length']].append(i)
-    
-    print(f"  Unique trajectory lengths: {len(length_groups)}")
-    
-    # Process by length groups (better cache utilization)
+
+    # Process all trajectories
     processed = 0
-    for length, indices in sorted(length_groups.items()):
-        for i in indices:
-            traj = trajectories[i]
-            flat = traj['flat']
-            
-            # Project raw trajectory onto adapted basis
-            # Note: The adapter handles the basis transformation internally
-            c = adapter.project(flat)
-            coefficients[i] = c
-            
-            # Compute reconstruction error for this trajectory
-            error_info = adapter.reconstruction_error(flat)
-            projection_errors.append(error_info['rmse'])
-            
-            processed += 1
-            if processed % 1000 == 0:
-                print(f"    Processed {processed}/{N} trajectories...")
-    
+    for i, traj in enumerate(trajectories):
+        flat = traj['flat']
+        T = traj['length']
+
+        # FIXED: Project via control points (same space as U_ref)
+        # Step 1: Fit B-spline control points to trajectory
+        cp = fit_bspline_control_points(flat, T_ref)
+
+        # Step 2: Project control points onto U_ref (with mean centering if applicable)
+        if mean is not None:
+            c = U_ref.T @ (cp - mean)
+        else:
+            c = U_ref.T @ cp
+
+        coefficients[i] = c
+
+        # Compute reconstruction error using CORRECT reconstruction
+        if mean is not None:
+            cp_recon = U_ref @ c + mean
+        else:
+            cp_recon = U_ref @ c
+
+        # Transform control points to trajectory length
+        C = build_interleaved_basis_matrix(T, T_ref)
+        recon = C @ cp_recon
+
+        rmse = np.sqrt(np.mean((flat - recon) ** 2))
+        projection_errors.append(rmse)
+
+        processed += 1
+        if processed % 1000 == 0:
+            print(f"    Processed {processed}/{N} trajectories...")
+
     projection_errors = np.array(projection_errors)
-    
+
     # Statistics
     print(f"\n  Projection complete:")
     print(f"    Reconstruction RMSE: mean={projection_errors.mean():.4f}, "
           f"median={np.median(projection_errors):.4f}, max={projection_errors.max():.4f}")
-    
-    # Coefficient statistics
+
     print(f"\n  Coefficient statistics:")
     print(f"    Shape: {coefficients.shape}")
     print(f"    Mean: {coefficients.mean():.4f}")
     print(f"    Std:  {coefficients.std():.4f}")
     print(f"    Range: [{coefficients.min():.4f}, {coefficients.max():.4f}]")
-    
-    # Per-component statistics
-    print(f"\n  Per-component standard deviations:")
+
     for k in range(min(K, 8)):
         print(f"    c[{k}]: std={coefficients[:, k].std():.4f}")
     if K > 8:
         print(f"    ... ({K - 8} more components)")
-    
-    # Check for any degenerate projections
+
     zero_coeffs = np.sum(np.all(np.abs(coefficients) < 1e-10, axis=1))
     if zero_coeffs > 0:
         print(f"\n  WARNING: {zero_coeffs} trajectories have near-zero coefficients!")
-    
+
     stats = {
         'reconstruction_rmse_mean': float(projection_errors.mean()),
         'reconstruction_rmse_max': float(projection_errors.max()),
         'coefficient_mean': float(coefficients.mean()),
         'coefficient_std': float(coefficients.std()),
-        'n_unique_lengths': len(length_groups),
+        'n_unique_lengths': 0,
     }
-    
-    # Store projection errors in trajectories for later analysis
+
     for i, err in enumerate(projection_errors):
         trajectories[i]['projection_rmse'] = err
-    
+
     return coefficients, adapter, stats
+
 
 
 # =============================================================================
@@ -961,13 +953,13 @@ def save_all_data(
     full_config = {
         # Core parameters
         **config,
-
+        
         # Computed values
         'K': K,
         'T_ref': T_ref,
         'n_control_points': T_ref,  # Alias for clarity
         'T_win': T_ref,  # Alias for train_singular_diffusion_v1.py compatibility
-
+        
         # Metadata
         'num_orientations': NUM_ORIENTATIONS,
         'num_distance_groups': NUM_DISTANCE_GROUPS,
@@ -1056,7 +1048,12 @@ def verify_preprocessing(
         c = coefficients[i]
         
         # Reconstruct at original length
-        recon = adapter.reconstruct(c, T)
+        cp_recon = adapter.U_ref @ c
+        if (output_dir / 'mean.npy').exists():
+            mean = np.load(output_dir / 'mean.npy')
+            cp_recon = cp_recon + mean
+        C = build_interleaved_basis_matrix(T, adapter.T_ref)
+        recon = C @ cp_recon
         
         # Compute error
         error = np.sqrt(np.mean((flat - recon) ** 2))
@@ -1137,7 +1134,12 @@ def verify_preprocessing(
             x_orig = flat[0::2]
             y_orig = flat[1::2]
             
-            recon = adapter.reconstruct(c, T)
+            cp_recon = adapter.U_ref @ c
+            if (output_dir / 'mean.npy').exists():
+                mean = np.load(output_dir / 'mean.npy')
+                cp_recon = cp_recon + mean
+            C = build_interleaved_basis_matrix(T, adapter.T_ref)
+            recon = C @ cp_recon
             x_recon = recon[0::2]
             y_recon = recon[1::2]
             
@@ -1353,11 +1355,14 @@ Examples:
         K=config['K'],
         center_data=config['center_data']
     )
-    
+
     # Step 3: Project trajectories to K-space
     coefficients, adapter, projection_stats = project_trajectories(
         trajectories, U_ref, T_ref, mean
     )
+    
+    print(f"DEBUG NEW: Using cp projection, first coeff: {coefficients[:3]}")
+    
     
     # Step 4: Generate group anchors
     group_anchors, group_stats = generate_group_anchors(
