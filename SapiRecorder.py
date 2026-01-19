@@ -22,24 +22,28 @@ from datetime import datetime
 from pynput import mouse
 
 # Configuration
-DOT_RADIUS = 10
+DOT_RADIUS = 30
 SESSION_TYPE = '3min'
-SESSION_DURATION_MS = 800000 if SESSION_TYPE == '1min' else 900000
-BREAK_DURATION_SEC = 15
-OUTPUT_DIR = r'D:\V8\user0001'
+SESSION_DURATION_MS = 900000 if SESSION_TYPE == '1min' else 900000
+BREAK_DURATION_SEC = 10
+OUTPUT_DIR = r'D:\V12\V12_bspline_basis-Original\user0001'
 MAX_DISTANCE_FROM_CENTER = 690
-TARGET_TRAJECTORIES = 192  # One complete cycle through all combinations
+TARGET_TRAJECTORIES = 120  # One complete cycle through all combinations
 
 # Validation Configuration
 VALIDATION_ENABLED = True  # Set to False to disable validation
-START_VELOCITY_THRESHOLD = 2  # px/s - max velocity for valid start dwell
+START_VELOCITY_THRESHOLD = 4  # px/s - max velocity for valid start dwell
 END_VELOCITY_THRESHOLD = 4    # px/s - max velocity for valid end dwell
 MIN_TRAJECTORY_LENGTH = 12     # Minimum Move events required
 DWELL_CHECK_POINTS = 4         # Number of points to check at start/end
 
 # Task Configuration
-DISTANCE_THRESHOLDS = [27, 31, 36, 41, 47, 54, 62, 71, 82, 94, 108, 124, 143, 164, 189, 217, 250, 288, 331, 381, 438, 504, 580, 667]
-#192 24 x 8
+DISTANCE_THRESHOLDS = [93, 225, 357, 489, 621]
+#5 thresholds (×8 = 40 recordings)
+#DISTANCE_THRESHOLDS = [27, 34, 43, 54, 68, 86, 108, 136, 171, 215, 271, 341, 429, 540, 667]
+#15 thresholds (×8 = 120 recordings)
+#DISTANCE_THRESHOLDS = [27, 31, 36, 41, 47, 54, 62, 71, 82, 94, 108, 124, 143, 164, 189, 217, 250, 288, 331, 381, 438, 504, 580, 667]
+#184 23 x 8
 ORIENTATIONS = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
 
 SCREEN_ANGLE_RANGES = {
@@ -49,7 +53,7 @@ SCREEN_ANGLE_RANGES = {
 }
 
 def generate_systematic_combinations():
-    """Generate all 192 combinations (24 distances × 8 orientations) systematically."""
+    """Generate all 120 combinations (15 distances × 8 orientations) systematically."""
     combinations = []
     for distance in DISTANCE_THRESHOLDS:
         for orientation in ORIENTATIONS:
