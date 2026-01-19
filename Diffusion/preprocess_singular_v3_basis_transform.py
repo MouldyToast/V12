@@ -117,13 +117,7 @@ DISTANCE_GROUPS = [
     {"name": "Large",  "id": 3, "min": 423, "max": 555},
     {"name": "XLarge", "id": 4, "min": 555, "max": 687},
 ]
-#DISTANCE_GROUPS = [
- #   {"name": "XSmall", "id": 0, "min": 0,   "max": 47},
- #   {"name": "Small",  "id": 1, "min": 47,  "max": 95},
- #   {"name": "Medium", "id": 2, "min": 95, "max": 180},
- #   {"name": "Large",  "id": 3, "min": 180, "max": 370},
- #   {"name": "XLarge", "id": 4, "min": 370, "max": 900},
-#]
+
 NUM_DISTANCE_GROUPS = 5
 
 # Screen angle ranges for orientation classification
