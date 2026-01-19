@@ -16,7 +16,6 @@ THE FIX:
   5. Remove only leading and trailing stationary periods
 
 This preserves:
-  - True 500Hz timing (dt always ~2ms)
   - Zero-movement intervals during movement (real pixel quantization)
   - Mid-trajectory pauses (real human hesitation)
 
@@ -26,7 +25,7 @@ This preserves:
   STEP 3 - python reconstruct_trajectories.py trajectories/ trajectories_reconstructed/ --verbose
 
 Usage:
-    python trajectory_splitter_adaptive.py combined_all_sessions.csv trajectories/
+    python trajectory_splitter_adaptive.py combined_sessions/combined_all_sessions.csv trajectories/
 """
 
 import csv
@@ -214,11 +213,7 @@ def split_and_extract_trajectories(csv_path, output_dir="trajectories",
             't': t_ext,
             'ideal_distance': ideal_distance,
             'actual_distance': actual_distance,
-            'original_length': original_len,
-            'extracted_length': extracted_len,
-            'leading_removed': leading_removed,
-            'trailing_removed': trailing_removed,
-            'processing': 'Movement period extraction (leading/trailing stationary removed, all else preserved)'
+            'extracted_length': extracted_len
         }
         
         # Save
@@ -297,8 +292,6 @@ def verify_timing(output_dir, num_samples=5):
             all_good = False
         
         print(f"\n{json_file.name}:")
-        print(f"  Points: {len(t)} (original: {data['original_length']})")
-        print(f"  Removed: {data['leading_removed']} leading, {data['trailing_removed']} trailing")
         print(f"  dt range: {min_dt:.0f}ms to {max_dt:.0f}ms {status}")
         print(f"  Zero-movement intervals: {zero_movement} (pixel quantization + pauses)")
     
