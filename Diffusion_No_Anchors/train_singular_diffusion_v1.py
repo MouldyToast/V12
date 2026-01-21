@@ -46,7 +46,7 @@ from tqdm import tqdm
 DEFAULT_CONFIG = {
     # Model
     'hidden_dim': 256,
-    'num_layers': 8, # was 4
+    'num_layers': 4, # was 4
     'dropout': 0.1,
 
     # Diffusion
@@ -58,7 +58,7 @@ DEFAULT_CONFIG = {
     'batch_size': 128,#128
     'learning_rate': 1e-3, # 3e-4
     'weight_decay': 1e-4,
-    'epochs': 800,
+    'epochs': 256,
     'warmup_epochs': 20,
     
     # Logging
