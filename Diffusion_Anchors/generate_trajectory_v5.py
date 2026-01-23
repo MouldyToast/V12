@@ -546,6 +546,406 @@ class TrajectoryGeneratorV5:
 
 
 # =============================================================================
+# CHAIN GENERATOR - Continuous Multi-Waypoint Paths
+# =============================================================================
+
+class ChainGenerator:
+    """
+    Generate continuous trajectories through multiple waypoints.
+
+    Key features:
+    - Subdivides long segments into trainable distances
+    - Each segment is generated with anticipation of the NEXT segment
+    - Transforms (scale/rotate/translate) generated segments to actual coordinates
+    - Smooth concatenation at waypoints
+
+    Usage:
+        chain_gen = ChainGenerator(generator)
+
+        # From explicit waypoints
+        waypoints = [(100, 100), (400, 300), (200, 500), (600, 400)]
+        trajectory = chain_gen.generate_chain(waypoints)
+
+        # Random path
+        waypoints, trajectory = chain_gen.generate_random_path(
+            start=(500, 500), num_waypoints=6
+        )
+    """
+
+    # Distance group boundaries (pixels) - must match preprocessing
+    DISTANCE_BOUNDARIES = [170, 340, 510, 687]  # XSmall/Small/Medium/Large/XLarge max
+
+    # Target segment length for subdivision (middle of Medium range)
+    TARGET_SEGMENT_LENGTH = 350
+
+    # Screen dimensions for random path generation
+    DEFAULT_SCREEN_WIDTH = 2560
+    DEFAULT_SCREEN_HEIGHT = 1440
+
+    def __init__(
+        self,
+        generator: TrajectoryGeneratorV5,
+        screen_width: int = None,
+        screen_height: int = None
+    ):
+        self.generator = generator
+        self.screen_width = screen_width or self.DEFAULT_SCREEN_WIDTH
+        self.screen_height = screen_height or self.DEFAULT_SCREEN_HEIGHT
+
+    def classify_orientation(self, dx: float, dy: float) -> int:
+        """
+        Classify movement direction into orientation ID (0-7).
+
+        Orientation mapping (screen coordinates, Y increases downward):
+            0: N  (up)        - angle ~= -90°
+            1: NE (up-right)  - angle ~= -45°
+            2: E  (right)     - angle ~= 0°
+            3: SE (down-right)- angle ~= 45°
+            4: S  (down)      - angle ~= 90°
+            5: SW (down-left) - angle ~= 135°
+            6: W  (left)      - angle ~= 180°
+            7: NW (up-left)   - angle ~= -135°
+        """
+        if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+            return 2  # Default to East for zero movement
+
+        # atan2 returns angle in radians, convert to degrees
+        angle_rad = np.arctan2(dy, dx)
+        angle_deg = np.degrees(angle_rad)
+
+        # Map angle to orientation
+        # E=0°, SE=45°, S=90°, SW=135°, W=180°/-180°, NW=-135°, N=-90°, NE=-45°
+        # We need to map to: N=0, NE=1, E=2, SE=3, S=4, SW=5, W=6, NW=7
+
+        # Shift so N (up, -90°) becomes 0
+        shifted = angle_deg + 90  # Now N=0, E=90, S=180, W=270
+
+        # Normalize to [0, 360)
+        shifted = shifted % 360
+
+        # Quantize to 8 bins (each 45°)
+        orient_id = int((shifted + 22.5) / 45) % 8
+
+        return orient_id
+
+    def classify_distance(self, dx: float, dy: float) -> int:
+        """
+        Classify movement distance into distance group (0-4).
+
+        Groups: XSmall(0), Small(1), Medium(2), Large(3), XLarge(4)
+        """
+        dist = np.sqrt(dx**2 + dy**2)
+
+        for i, boundary in enumerate(self.DISTANCE_BOUNDARIES):
+            if dist <= boundary:
+                return i
+
+        return 4  # XLarge
+
+    def subdivide_segment(
+        self,
+        start: Tuple[float, float],
+        end: Tuple[float, float],
+        target_length: float = None
+    ) -> List[Tuple[float, float]]:
+        """
+        Subdivide a long segment into natural-length pieces.
+
+        If the segment is within the max trainable distance, returns [start, end].
+        Otherwise, inserts intermediate waypoints along the line.
+
+        Args:
+            start: Starting point (x, y)
+            end: Ending point (x, y)
+            target_length: Target length for each sub-segment
+
+        Returns:
+            List of waypoints including start and end
+        """
+        if target_length is None:
+            target_length = self.TARGET_SEGMENT_LENGTH
+
+        dx = end[0] - start[0]
+        dy = end[1] - start[1]
+        total_dist = np.sqrt(dx**2 + dy**2)
+
+        # If within max trainable distance, no subdivision needed
+        max_trainable = self.DISTANCE_BOUNDARIES[-1]
+        if total_dist <= max_trainable:
+            return [start, end]
+
+        # Calculate number of subdivisions
+        n_segments = int(np.ceil(total_dist / target_length))
+        n_segments = max(2, n_segments)  # At least 2 segments
+
+        # Create intermediate waypoints
+        waypoints = [start]
+        for i in range(1, n_segments):
+            t = i / n_segments
+            wp = (start[0] + t * dx, start[1] + t * dy)
+            waypoints.append(wp)
+        waypoints.append(end)
+
+        return waypoints
+
+    def transform_trajectory(
+        self,
+        trajectory: np.ndarray,
+        start: Tuple[float, float],
+        end: Tuple[float, float]
+    ) -> np.ndarray:
+        """
+        Transform a generated trajectory to match actual start/end positions.
+
+        The generated trajectory starts at origin and points in a canonical direction.
+        This function scales, rotates, and translates it to match the actual segment.
+
+        Args:
+            trajectory: [T, 2] array starting at origin
+            start: Actual start position (x, y)
+            end: Actual end position (x, y)
+
+        Returns:
+            Transformed trajectory [T, 2]
+        """
+        # Actual displacement
+        actual_dx = end[0] - start[0]
+        actual_dy = end[1] - start[1]
+        actual_dist = np.sqrt(actual_dx**2 + actual_dy**2)
+        actual_angle = np.arctan2(actual_dy, actual_dx)
+
+        # Generated trajectory endpoint
+        gen_endpoint = trajectory[-1]
+        gen_dist = np.sqrt(gen_endpoint[0]**2 + gen_endpoint[1]**2)
+        gen_angle = np.arctan2(gen_endpoint[1], gen_endpoint[0])
+
+        # Avoid division by zero
+        if gen_dist < 1e-6:
+            # Degenerate trajectory - just translate to start
+            return trajectory + np.array(start)
+
+        # Scale factor
+        scale = actual_dist / gen_dist
+
+        # Rotation angle
+        rotation = actual_angle - gen_angle
+
+        # Apply scale
+        scaled = trajectory * scale
+
+        # Apply rotation
+        cos_r = np.cos(rotation)
+        sin_r = np.sin(rotation)
+        rotated = np.column_stack([
+            scaled[:, 0] * cos_r - scaled[:, 1] * sin_r,
+            scaled[:, 0] * sin_r + scaled[:, 1] * cos_r
+        ])
+
+        # Translate to start position
+        translated = rotated + np.array(start)
+
+        return translated
+
+    def generate_chain(
+        self,
+        waypoints: List[Tuple[float, float]],
+        seed: Optional[int] = None,
+        verbose: bool = True
+    ) -> Tuple[np.ndarray, Dict]:
+        """
+        Generate a continuous trajectory through waypoints.
+
+        Algorithm:
+        1. Subdivide any segments that exceed max trainable distance
+        2. For each segment, generate with anticipation of next segment
+        3. Transform each segment to actual coordinates
+        4. Concatenate smoothly (remove duplicate points)
+
+        Args:
+            waypoints: List of (x, y) waypoints
+            seed: Random seed for reproducibility
+            verbose: Print progress information
+
+        Returns:
+            trajectory: [N, 2] full trajectory array
+            info: Dict with generation metadata
+        """
+        if len(waypoints) < 2:
+            raise ValueError("Need at least 2 waypoints")
+
+        if seed is not None:
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+
+        # Step 1: Subdivide long segments
+        expanded_waypoints = [waypoints[0]]
+        for i in range(len(waypoints) - 1):
+            sub_wps = self.subdivide_segment(waypoints[i], waypoints[i + 1])
+            expanded_waypoints.extend(sub_wps[1:])  # Skip first (already added)
+
+        if verbose and len(expanded_waypoints) > len(waypoints):
+            print(f"  Subdivided {len(waypoints)} waypoints → {len(expanded_waypoints)} waypoints")
+
+        waypoints = expanded_waypoints
+        n_segments = len(waypoints) - 1
+
+        # Step 2: Generate each segment
+        segments = []
+        segment_infos = []
+
+        for i in range(n_segments):
+            A = waypoints[i]
+            B = waypoints[i + 1]
+            C = waypoints[i + 2] if i + 2 < len(waypoints) else None
+
+            # Compute AB conditioning
+            dx_AB = B[0] - A[0]
+            dy_AB = B[1] - A[1]
+            orient_AB = self.classify_orientation(dx_AB, dy_AB)
+            dist_AB = self.classify_distance(dx_AB, dy_AB)
+
+            # Compute BC conditioning (anticipation)
+            if C is not None:
+                dx_BC = C[0] - B[0]
+                dy_BC = C[1] - B[1]
+                orient_BC = self.classify_orientation(dx_BC, dy_BC)
+                dist_BC = self.classify_distance(dx_BC, dy_BC)
+            else:
+                # Final segment - no anticipation, continue straight
+                orient_BC = orient_AB
+                dist_BC = dist_AB
+
+            # Generate segment
+            traj, info = self.generator.generate_single(
+                orient_AB, dist_AB,
+                orient_BC, dist_BC,
+                seed=None  # Already seeded at start
+            )
+
+            # Transform to actual coordinates
+            transformed = self.transform_trajectory(traj, A, B)
+
+            segments.append(transformed)
+            segment_infos.append({
+                'segment_idx': i,
+                'A': A,
+                'B': B,
+                'C': C,
+                'orient_AB': orient_AB,
+                'dist_AB': dist_AB,
+                'orient_BC': orient_BC,
+                'dist_BC': dist_BC,
+                'turn_cat': info['turn_cat'],
+                'turn_cat_name': info['turn_cat_name'],
+                'turn_angle': info['turn_angle'],
+                'generated_length': len(traj),
+            })
+
+        # Step 3: Concatenate segments
+        full_trajectory = [segments[0]]
+        for seg in segments[1:]:
+            full_trajectory.append(seg[1:])  # Skip first point (duplicate)
+
+        full_trajectory = np.vstack(full_trajectory)
+
+        # Build info
+        chain_info = {
+            'original_waypoints': waypoints[:len(waypoints)],
+            'expanded_waypoints': waypoints,
+            'n_segments': n_segments,
+            'total_points': len(full_trajectory),
+            'segment_infos': segment_infos,
+            'seed': seed,
+        }
+
+        if verbose:
+            print(f"  Generated chain: {n_segments} segments, {len(full_trajectory)} points")
+            turn_summary = {}
+            for si in segment_infos:
+                tc = si['turn_cat_name']
+                turn_summary[tc] = turn_summary.get(tc, 0) + 1
+            print(f"  Turn categories: {turn_summary}")
+
+        return full_trajectory, chain_info
+
+    def generate_random_path(
+        self,
+        start: Tuple[float, float] = None,
+        num_waypoints: int = 5,
+        min_distance: float = 200,
+        max_distance: float = 500,
+        margin: float = 50,
+        seed: Optional[int] = None,
+        verbose: bool = True
+    ) -> Tuple[List[Tuple[float, float]], np.ndarray, Dict]:
+        """
+        Generate random waypoints and trajectory.
+
+        Args:
+            start: Starting position (default: center of screen)
+            num_waypoints: Number of waypoints to generate
+            min_distance: Minimum distance between consecutive waypoints
+            max_distance: Maximum distance between consecutive waypoints
+            margin: Minimum distance from screen edges
+            seed: Random seed
+            verbose: Print progress
+
+        Returns:
+            waypoints: List of (x, y) waypoints
+            trajectory: [N, 2] full trajectory array
+            info: Dict with generation metadata
+        """
+        if seed is not None:
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+
+        # Default start at center
+        if start is None:
+            start = (self.screen_width / 2, self.screen_height / 2)
+
+        waypoints = [start]
+
+        for _ in range(num_waypoints - 1):
+            last = waypoints[-1]
+
+            # Try to find a valid next waypoint
+            for attempt in range(100):
+                # Random direction
+                angle = np.random.uniform(0, 2 * np.pi)
+                # Random distance
+                dist = np.random.uniform(min_distance, max_distance)
+
+                dx = dist * np.cos(angle)
+                dy = dist * np.sin(angle)
+
+                new_x = last[0] + dx
+                new_y = last[1] + dy
+
+                # Check bounds
+                if (margin <= new_x <= self.screen_width - margin and
+                    margin <= new_y <= self.screen_height - margin):
+                    waypoints.append((new_x, new_y))
+                    break
+            else:
+                # Couldn't find valid point, clamp to bounds
+                new_x = np.clip(last[0] + dx, margin, self.screen_width - margin)
+                new_y = np.clip(last[1] + dy, margin, self.screen_height - margin)
+                waypoints.append((new_x, new_y))
+
+        if verbose:
+            print(f"\nGenerated {len(waypoints)} random waypoints")
+
+        # Generate chain through waypoints
+        trajectory, chain_info = self.generate_chain(waypoints, seed=None, verbose=verbose)
+
+        chain_info['random_seed'] = seed
+        chain_info['min_distance'] = min_distance
+        chain_info['max_distance'] = max_distance
+
+        return waypoints, trajectory, chain_info
+
+
+# =============================================================================
 # VISUALIZATION
 # =============================================================================
 
@@ -696,6 +1096,163 @@ def visualize_anticipatory_comparison(
     return fig
 
 
+def visualize_chain(
+    trajectory: np.ndarray,
+    chain_info: Dict,
+    title: str = "Chain Trajectory",
+    show_waypoints: bool = True,
+    show_segments: bool = True,
+    save_path: Optional[str] = None
+) -> plt.Figure:
+    """
+    Visualize a chain trajectory with waypoints and segment info.
+
+    Args:
+        trajectory: [N, 2] full trajectory array
+        chain_info: Info dict from generate_chain()
+        title: Plot title
+        show_waypoints: Draw waypoint markers
+        show_segments: Color-code segments by turn category
+        save_path: Path to save figure
+    """
+    fig, ax = plt.subplots(figsize=(12, 10))
+
+    waypoints = chain_info['expanded_waypoints']
+    segment_infos = chain_info['segment_infos']
+
+    if show_segments and len(segment_infos) > 0:
+        # Color-code by segment
+        point_idx = 0
+        for i, seg_info in enumerate(segment_infos):
+            seg_len = seg_info['generated_length']
+            if i > 0:
+                seg_len -= 1  # Account for removed duplicate
+
+            end_idx = min(point_idx + seg_len, len(trajectory))
+
+            # Get color from turn category
+            turn_cat = seg_info['turn_cat']
+            color = TURN_CATEGORIES[turn_cat]['color']
+
+            seg_traj = trajectory[point_idx:end_idx + 1]
+            ax.plot(seg_traj[:, 0], seg_traj[:, 1],
+                   color=color, linewidth=2, alpha=0.8)
+
+            point_idx = end_idx
+    else:
+        # Single color
+        ax.plot(trajectory[:, 0], trajectory[:, 1],
+               'b-', linewidth=2, alpha=0.8)
+
+    # Draw waypoints
+    if show_waypoints and len(waypoints) > 0:
+        wp_array = np.array(waypoints)
+
+        # All intermediate waypoints
+        if len(wp_array) > 2:
+            ax.scatter(wp_array[1:-1, 0], wp_array[1:-1, 1],
+                      c='orange', s=80, marker='D', zorder=10,
+                      edgecolors='black', linewidths=1,
+                      label='Waypoints')
+
+        # Start point
+        ax.scatter(wp_array[0, 0], wp_array[0, 1],
+                  c='green', s=150, marker='o', zorder=11,
+                  edgecolors='black', linewidths=2,
+                  label='Start')
+
+        # End point
+        ax.scatter(wp_array[-1, 0], wp_array[-1, 1],
+                  c='red', s=150, marker='X', zorder=11,
+                  edgecolors='black', linewidths=2,
+                  label='End')
+
+        # Add waypoint labels
+        for i, (x, y) in enumerate(waypoints):
+            ax.annotate(f'W{i}', (x, y), textcoords='offset points',
+                       xytext=(5, 5), fontsize=8, alpha=0.7)
+
+    # Add info to title
+    n_seg = chain_info['n_segments']
+    n_pts = chain_info['total_points']
+    title += f"\n{n_seg} segments, {n_pts} points"
+
+    ax.set_title(title, fontsize=14)
+    ax.set_xlabel('X (pixels)')
+    ax.set_ylabel('Y (pixels)')
+    ax.legend(loc='upper right')
+    ax.set_aspect('equal')
+    ax.invert_yaxis()
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"  Saved: {save_path}")
+
+    plt.close()
+    return fig
+
+
+def visualize_chain_segments(
+    chain_info: Dict,
+    save_path: Optional[str] = None
+) -> plt.Figure:
+    """
+    Visualize chain segment details - turn categories and angles.
+    """
+    segment_infos = chain_info['segment_infos']
+    n_segments = len(segment_infos)
+
+    if n_segments == 0:
+        return None
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Left: Turn category distribution
+    ax1 = axes[0]
+    turn_cats = [si['turn_cat'] for si in segment_infos]
+    turn_names = [TURN_CATEGORY_NAMES[tc] for tc in turn_cats]
+
+    # Count occurrences
+    from collections import Counter
+    counts = Counter(turn_names)
+
+    names = [tc['name'] for tc in TURN_CATEGORIES]
+    values = [counts.get(n, 0) for n in names]
+    colors = [tc['color'] for tc in TURN_CATEGORIES]
+
+    ax1.bar(range(7), values, color=colors)
+    ax1.set_xticks(range(7))
+    ax1.set_xticklabels(names, rotation=45, ha='right')
+    ax1.set_ylabel('Count')
+    ax1.set_title('Turn Category Distribution')
+
+    # Right: Turn angles over path
+    ax2 = axes[1]
+    turn_angles = [si['turn_angle'] for si in segment_infos]
+    segment_indices = range(len(turn_angles))
+
+    colors_per_seg = [TURN_CATEGORIES[tc]['color'] for tc in turn_cats]
+    ax2.bar(segment_indices, turn_angles, color=colors_per_seg)
+    ax2.axhline(0, color='black', linewidth=0.5)
+    ax2.set_xlabel('Segment Index')
+    ax2.set_ylabel('Turn Angle (°)')
+    ax2.set_title('Turn Angles Along Path')
+    ax2.set_ylim(-180, 180)
+
+    plt.suptitle('Chain Segment Analysis', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"  Saved: {save_path}")
+
+    plt.close()
+    return fig
+
+
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -718,6 +1275,14 @@ Examples:
     # Show anticipatory comparison (same AB, different BC)
     python generate_trajectory_v5.py --checkpoint checkpoints_v5/best_model.pt \\
         --data processed_v5/ --anticipatory_demo --visualize
+
+    # CHAIN GENERATION - through explicit waypoints
+    python generate_trajectory_v5.py --checkpoint checkpoints_v5/best_model.pt \\
+        --data processed_v5/ --chain "100,100;400,300;200,500;600,400" --visualize
+
+    # RANDOM PATH - generate random waypoints and chain
+    python generate_trajectory_v5.py --checkpoint checkpoints_v5/best_model.pt \\
+        --data processed_v5/ --random_path 6 --visualize
 """
     )
 
@@ -753,6 +1318,18 @@ Examples:
     parser.add_argument('--anticipatory_demo', action='store_true',
                         help='Show same AB with different BC directions')
 
+    # Chain generation options
+    parser.add_argument('--chain', type=str, default=None,
+                        help='Generate chain through waypoints: "x1,y1;x2,y2;x3,y3;..."')
+    parser.add_argument('--random_path', type=int, default=None,
+                        help='Generate random path with N waypoints')
+    parser.add_argument('--start', type=str, default=None,
+                        help='Start position for random path: "x,y" (default: screen center)')
+    parser.add_argument('--screen_width', type=int, default=2560,
+                        help='Screen width for random path generation')
+    parser.add_argument('--screen_height', type=int, default=1440,
+                        help='Screen height for random path generation')
+
     parser.add_argument('--device', type=str,
                         default='cuda' if torch.cuda.is_available() else 'cpu',
                         help='Device to use')
@@ -773,6 +1350,119 @@ Examples:
     # Create generator
     print("\nInitializing V5 generator...")
     generator = TrajectoryGeneratorV5(args.checkpoint, args.data, device=args.device)
+
+    # =========================================================================
+    # CHAIN GENERATION MODE
+    # =========================================================================
+    if args.chain:
+        print("\n" + "=" * 70)
+        print("CHAIN GENERATION MODE")
+        print("=" * 70)
+
+        # Parse waypoints from string "x1,y1;x2,y2;x3,y3"
+        try:
+            waypoints = []
+            for wp_str in args.chain.split(';'):
+                x, y = map(float, wp_str.strip().split(','))
+                waypoints.append((x, y))
+            print(f"\nParsed {len(waypoints)} waypoints:")
+            for i, (x, y) in enumerate(waypoints):
+                print(f"  W{i}: ({x:.1f}, {y:.1f})")
+        except ValueError as e:
+            print(f"\nERROR: Invalid waypoint format: {e}")
+            print("Expected format: --chain \"x1,y1;x2,y2;x3,y3\"")
+            return
+
+        # Create chain generator
+        chain_gen = ChainGenerator(
+            generator,
+            screen_width=args.screen_width,
+            screen_height=args.screen_height
+        )
+
+        # Generate chain
+        trajectory, chain_info = chain_gen.generate_chain(
+            waypoints, seed=args.seed, verbose=True
+        )
+
+        # Save trajectory
+        np.save(output_dir / 'chain_trajectory.npy', trajectory)
+        print(f"\nSaved trajectory to {output_dir / 'chain_trajectory.npy'}")
+
+        # Visualize
+        if args.visualize:
+            vis_path = output_dir / 'chain_trajectory.png'
+            visualize_chain(
+                trajectory, chain_info,
+                title='Chain Trajectory',
+                save_path=str(vis_path)
+            )
+
+            seg_vis_path = output_dir / 'chain_segments.png'
+            visualize_chain_segments(chain_info, save_path=str(seg_vis_path))
+
+        print("\n" + "=" * 70)
+        print("CHAIN GENERATION COMPLETE")
+        print("=" * 70)
+        return
+
+    # =========================================================================
+    # RANDOM PATH GENERATION MODE
+    # =========================================================================
+    if args.random_path:
+        print("\n" + "=" * 70)
+        print("RANDOM PATH GENERATION MODE")
+        print("=" * 70)
+
+        # Parse start position
+        start = None
+        if args.start:
+            try:
+                x, y = map(float, args.start.split(','))
+                start = (x, y)
+            except ValueError:
+                print(f"WARNING: Invalid start format '{args.start}', using center")
+
+        # Create chain generator
+        chain_gen = ChainGenerator(
+            generator,
+            screen_width=args.screen_width,
+            screen_height=args.screen_height
+        )
+
+        # Generate random path
+        waypoints, trajectory, chain_info = chain_gen.generate_random_path(
+            start=start,
+            num_waypoints=args.random_path,
+            seed=args.seed,
+            verbose=True
+        )
+
+        # Save
+        np.save(output_dir / 'random_path_trajectory.npy', trajectory)
+        np.save(output_dir / 'random_path_waypoints.npy', np.array(waypoints))
+        print(f"\nSaved trajectory to {output_dir / 'random_path_trajectory.npy'}")
+
+        # Visualize
+        if args.visualize:
+            vis_path = output_dir / 'random_path_trajectory.png'
+            visualize_chain(
+                trajectory, chain_info,
+                title=f'Random Path ({args.random_path} waypoints)',
+                save_path=str(vis_path)
+            )
+
+            seg_vis_path = output_dir / 'random_path_segments.png'
+            visualize_chain_segments(chain_info, save_path=str(seg_vis_path))
+
+        print("\n" + "=" * 70)
+        print("RANDOM PATH GENERATION COMPLETE")
+        print("=" * 70)
+        return
+
+    # =========================================================================
+    # SINGLE SEGMENT / CATEGORY GENERATION MODE
+    # =========================================================================
 
     # Generate based on arguments
     if args.orient_AB and args.orient_BC:
