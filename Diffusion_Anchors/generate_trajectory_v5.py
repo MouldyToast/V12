@@ -692,53 +692,41 @@ class ChainGenerator:
         self,
         trajectory: np.ndarray,
         start: Tuple[float, float],
-        end: Tuple[float, float]
+        target_direction: Tuple[float, float]
     ) -> np.ndarray:
         """
-        Transform a generated trajectory to match actual start/end positions.
+        Transform a generated trajectory: ROTATE + TRANSLATE only. NO SCALING.
 
-        The generated trajectory starts at origin and points in a canonical direction.
-        This function scales, rotates, and translates it to match the actual segment.
+        The generated trajectory starts at origin. We rotate it to point toward
+        the target direction, then translate to start position.
+
+        CRITICAL: We do NOT scale the trajectory. The model generates natural
+        lengths for the distance group. Scaling would destroy the natural shape.
 
         Args:
             trajectory: [T, 2] array starting at origin
-            start: Actual start position (x, y)
-            end: Actual end position (x, y)
+            start: Start position (x, y)
+            target_direction: Direction to point toward (dx, dy from start)
 
         Returns:
             Transformed trajectory [T, 2]
         """
-        # Actual displacement
-        actual_dx = end[0] - start[0]
-        actual_dy = end[1] - start[1]
-        actual_dist = np.sqrt(actual_dx**2 + actual_dy**2)
-        actual_angle = np.arctan2(actual_dy, actual_dx)
+        # Target direction angle
+        target_angle = np.arctan2(target_direction[1], target_direction[0])
 
-        # Generated trajectory endpoint
+        # Generated trajectory direction (from endpoint)
         gen_endpoint = trajectory[-1]
-        gen_dist = np.sqrt(gen_endpoint[0]**2 + gen_endpoint[1]**2)
         gen_angle = np.arctan2(gen_endpoint[1], gen_endpoint[0])
 
-        # Avoid division by zero
-        if gen_dist < 1e-6:
-            # Degenerate trajectory - just translate to start
-            return trajectory + np.array(start)
+        # Rotation needed to align generated direction with target
+        rotation = target_angle - gen_angle
 
-        # Scale factor
-        scale = actual_dist / gen_dist
-
-        # Rotation angle
-        rotation = actual_angle - gen_angle
-
-        # Apply scale
-        scaled = trajectory * scale
-
-        # Apply rotation
+        # Apply rotation (NO SCALING!)
         cos_r = np.cos(rotation)
         sin_r = np.sin(rotation)
         rotated = np.column_stack([
-            scaled[:, 0] * cos_r - scaled[:, 1] * sin_r,
-            scaled[:, 0] * sin_r + scaled[:, 1] * cos_r
+            trajectory[:, 0] * cos_r - trajectory[:, 1] * sin_r,
+            trajectory[:, 0] * sin_r + trajectory[:, 1] * cos_r
         ])
 
         # Translate to start position
@@ -790,21 +778,25 @@ class ChainGenerator:
         n_segments = len(waypoints) - 1
 
         # Step 2: Generate each segment
+        # IMPORTANT: We use actual endpoints, not waypoints, for seamless concatenation
+        # Waypoints are DIRECTION GUIDES, not exact targets
         segments = []
         segment_infos = []
+        current_pos = waypoints[0]  # Start at first waypoint
 
         for i in range(n_segments):
-            A = waypoints[i]
-            B = waypoints[i + 1]
+            # Current position is either first waypoint or actual endpoint of previous segment
+            A = current_pos
+            B = waypoints[i + 1]  # Target waypoint (direction guide)
             C = waypoints[i + 2] if i + 2 < len(waypoints) else None
 
-            # Compute AB conditioning
+            # Compute AB conditioning (direction from A toward B)
             dx_AB = B[0] - A[0]
             dy_AB = B[1] - A[1]
             orient_AB = self.classify_orientation(dx_AB, dy_AB)
             dist_AB = self.classify_distance(dx_AB, dy_AB)
 
-            # Compute BC conditioning (anticipation)
+            # Compute BC conditioning (anticipation - direction from B toward C)
             if C is not None:
                 dx_BC = C[0] - B[0]
                 dy_BC = C[1] - B[1]
@@ -815,22 +807,29 @@ class ChainGenerator:
                 orient_BC = orient_AB
                 dist_BC = dist_AB
 
-            # Generate segment
+            # Generate segment (model outputs natural length for distance group)
             traj, info = self.generator.generate_single(
                 orient_AB, dist_AB,
                 orient_BC, dist_BC,
                 seed=None  # Already seeded at start
             )
 
-            # Transform to actual coordinates
-            transformed = self.transform_trajectory(traj, A, B)
+            # Transform: rotate to target direction, translate to start
+            # NO SCALING - we trust the model's natural output length
+            direction = (dx_AB, dy_AB)
+            transformed = self.transform_trajectory(traj, A, direction)
 
             segments.append(transformed)
+
+            # CRITICAL: Next segment starts at actual endpoint, not waypoint B
+            current_pos = (transformed[-1, 0], transformed[-1, 1])
+
             segment_infos.append({
                 'segment_idx': i,
-                'A': A,
-                'B': B,
-                'C': C,
+                'start': A,
+                'target_waypoint': B,
+                'actual_endpoint': current_pos,
+                'next_waypoint': C,
                 'orient_AB': orient_AB,
                 'dist_AB': dist_AB,
                 'orient_BC': orient_BC,
@@ -841,10 +840,10 @@ class ChainGenerator:
                 'generated_length': len(traj),
             })
 
-        # Step 3: Concatenate segments
+        # Step 3: Concatenate segments (already seamless - each starts at previous endpoint)
         full_trajectory = [segments[0]]
         for seg in segments[1:]:
-            full_trajectory.append(seg[1:])  # Skip first point (duplicate)
+            full_trajectory.append(seg[1:])  # Skip first point (duplicate of previous endpoint)
 
         full_trajectory = np.vstack(full_trajectory)
 
@@ -1107,6 +1106,11 @@ def visualize_chain(
     """
     Visualize a chain trajectory with waypoints and segment info.
 
+    Shows:
+    - Actual trajectory (colored by turn category)
+    - Target waypoints (direction guides) in orange
+    - Actual start (green) and end (red)
+
     Args:
         trajectory: [N, 2] full trajectory array
         chain_info: Info dict from generate_chain()
@@ -1144,28 +1148,33 @@ def visualize_chain(
         ax.plot(trajectory[:, 0], trajectory[:, 1],
                'b-', linewidth=2, alpha=0.8)
 
-    # Draw waypoints
+    # Draw waypoints (these are DIRECTION GUIDES, path may not hit them exactly)
     if show_waypoints and len(waypoints) > 0:
         wp_array = np.array(waypoints)
 
-        # All intermediate waypoints
+        # Intermediate waypoints (direction guides)
         if len(wp_array) > 2:
             ax.scatter(wp_array[1:-1, 0], wp_array[1:-1, 1],
                       c='orange', s=80, marker='D', zorder=10,
-                      edgecolors='black', linewidths=1,
-                      label='Waypoints')
+                      edgecolors='black', linewidths=1, alpha=0.6,
+                      label='Target waypoints (guides)')
 
-        # Start point
+        # First waypoint (actual start)
         ax.scatter(wp_array[0, 0], wp_array[0, 1],
                   c='green', s=150, marker='o', zorder=11,
                   edgecolors='black', linewidths=2,
                   label='Start')
 
-        # End point
+        # Last waypoint (target end - may not be exact)
         ax.scatter(wp_array[-1, 0], wp_array[-1, 1],
+                  c='orange', s=100, marker='D', zorder=10,
+                  edgecolors='black', linewidths=1, alpha=0.6)
+
+        # Actual trajectory endpoint
+        ax.scatter(trajectory[-1, 0], trajectory[-1, 1],
                   c='red', s=150, marker='X', zorder=11,
                   edgecolors='black', linewidths=2,
-                  label='End')
+                  label='Actual end')
 
         # Add waypoint labels
         for i, (x, y) in enumerate(waypoints):
