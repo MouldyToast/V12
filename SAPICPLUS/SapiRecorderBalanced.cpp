@@ -1,11 +1,15 @@
 /**
  * SapiAgent Three-Dot Flow Recorder - BALANCED VERSION (C++)
- * Version: 8.0.0 - PRECOMPUTED BALANCED PATH
+ * Version: 8.1.0 - ENHANCED MULTI-THREADED ARCHITECTURE
  *
- * Multi-threaded C++ implementation with dedicated threads for:
- * - Main Thread: Window management, rendering, event handling
- * - Sampling Thread: 125Hz mouse position polling
- * - File I/O Thread: Asynchronous segment JSON saving
+ * Optimized for Intel i5-10600K (6 cores / 12 threads)
+ *
+ * Thread Architecture:
+ * - Thread 1: Main Thread - SDL2 rendering & window management
+ * - Thread 2: Event Processing Thread - Decoupled event handling
+ * - Thread 3: Sampling Thread - 125Hz mouse position polling
+ * - Thread 4: Computation Thread - Segment metadata calculations
+ * - Thread 5-6: File I/O Thread Pool - Parallel JSON saving (2 workers)
  *
  * Build: g++ -std=c++17 -O2 SapiRecorderBalanced.cpp -o SapiRecorder -lSDL2 -lSDL2_ttf -pthread
  */
@@ -123,58 +127,167 @@ public:
 };
 
 // =============================================================================
-// FILE I/O THREAD
+// COMPUTATION THREAD - Segment Metadata Processing
 // =============================================================================
 
-class FileIOThread {
+class ComputationThread {
 public:
-    FileIOThread(const std::string& segments_dir)
-        : segments_dir_(segments_dir), running_(false) {}
+    ComputationThread(ThreadStats& stats)
+        : stats_(stats), running_(false) {}
 
-    ~FileIOThread() {
+    ~ComputationThread() {
         stop();
     }
 
     void start() {
         running_ = true;
-        thread_ = std::thread(&FileIOThread::run, this);
-        std::cout << "[FileIOThread] Started\n";
+        thread_ = std::thread(&ComputationThread::run, this);
+        ThreadUtils::setThreadName("Compute");
+        std::cout << "[ComputationThread] Started\n";
     }
 
     void stop() {
         running_ = false;
-        save_queue_.shutdown();
+        input_queue_.shutdown();
         if (thread_.joinable()) {
             thread_.join();
         }
-        std::cout << "[FileIOThread] Stopped\n";
+        std::cout << "[ComputationThread] Stopped (processed: " << stats_.segments_computed << ")\n";
     }
 
-    void enqueueSegment(const SegmentData& segment) {
-        save_queue_.push(segment);
+    void enqueue(RawSegmentData raw) {
+        input_queue_.push(std::move(raw));
+    }
+
+    void setOutputCallback(ComputationCompleteCallback cb) {
+        output_callback_ = std::move(cb);
     }
 
     size_t pendingCount() const {
-        return save_queue_.size();
+        return input_queue_.size();
     }
 
 private:
     void run() {
         while (running_) {
-            SegmentData segment;
-            if (save_queue_.pop(segment, 100)) {
-                saveSegment(segment);
+            RawSegmentData raw;
+            if (input_queue_.pop(raw, 50)) {
+                auto start_time = std::chrono::high_resolution_clock::now();
+
+                SegmentData segment = computeSegment(raw);
+
+                auto end_time = std::chrono::high_resolution_clock::now();
+                auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+                stats_.avg_compute_time_us = duration.count();
+                stats_.segments_computed++;
+
+                if (output_callback_) {
+                    output_callback_(std::move(segment));
+                }
             }
         }
 
-        // Drain remaining segments
-        SegmentData segment;
-        while (save_queue_.pop(segment, 0)) {
-            saveSegment(segment);
+        // Drain remaining
+        RawSegmentData raw;
+        while (input_queue_.pop(raw, 0)) {
+            SegmentData segment = computeSegment(raw);
+            if (output_callback_) {
+                output_callback_(std::move(segment));
+            }
         }
     }
 
+    SegmentData computeSegment(const RawSegmentData& raw) {
+        SegmentData seg;
+
+        // Copy basic info
+        seg.segment_id = raw.segment_id;
+        seg.timestamp_start = raw.timestamp_start;
+        seg.timestamp_end = raw.timestamp_end;
+        seg.duration_ms = raw.timestamp_end - raw.timestamp_start;
+
+        seg.dot_A = raw.dot_A;
+        seg.dot_B = raw.dot_B;
+        seg.dot_C = raw.dot_C;
+
+        // Compute AB metrics
+        double vec_AB_x = raw.dot_B.x - raw.dot_A.x;
+        double vec_AB_y = raw.dot_B.y - raw.dot_A.y;
+        seg.ab_distance = std::hypot(vec_AB_x, vec_AB_y);
+        seg.ab_angle_deg = Helpers::rad2deg(std::atan2(vec_AB_y, vec_AB_x));
+        seg.ab_orientation = Helpers::getOrientationFromAngle(seg.ab_angle_deg);
+        seg.ab_orientation_id = Helpers::getOrientationId(seg.ab_orientation);
+        auto [ab_group, ab_name] = Helpers::getDistanceGroup(seg.ab_distance);
+        seg.ab_distance_group = ab_group;
+        seg.ab_distance_name = ab_name;
+
+        // Compute BC metrics
+        double vec_BC_x = raw.dot_C.x - raw.dot_B.x;
+        double vec_BC_y = raw.dot_C.y - raw.dot_B.y;
+        seg.bc_distance = std::hypot(vec_BC_x, vec_BC_y);
+        seg.bc_angle_deg = Helpers::rad2deg(std::atan2(vec_BC_y, vec_BC_x));
+        seg.bc_orientation = Helpers::getOrientationFromAngle(seg.bc_angle_deg);
+        seg.bc_orientation_id = Helpers::getOrientationId(seg.bc_orientation);
+        auto [bc_group, bc_name] = Helpers::getDistanceGroup(seg.bc_distance);
+        seg.bc_distance_group = bc_group;
+        seg.bc_distance_name = bc_name;
+
+        // Compute turn
+        seg.turn_angle_deg = Helpers::angleBetweenVectors(vec_AB_x, vec_AB_y, vec_BC_x, vec_BC_y);
+        seg.turn_category = Helpers::getTurnCategory(seg.turn_angle_deg);
+
+        // Copy trajectory
+        seg.trajectory = raw.trajectory;
+        seg.computed = true;
+
+        return seg;
+    }
+
+    ThreadStats& stats_;
+    std::atomic<bool> running_;
+    std::thread thread_;
+    ThreadSafeQueue<RawSegmentData> input_queue_;
+    ComputationCompleteCallback output_callback_;
+};
+
+// =============================================================================
+// FILE I/O THREAD POOL - Parallel JSON Saving
+// =============================================================================
+
+class FileIOThreadPool {
+public:
+    FileIOThreadPool(const std::string& segments_dir, size_t num_workers, ThreadStats& stats)
+        : segments_dir_(segments_dir), stats_(stats),
+          pool_(num_workers, "FileIO") {}
+
+    ~FileIOThreadPool() {
+        stop();
+    }
+
+    void start() {
+        pool_.start();
+        std::cout << "[FileIOThreadPool] Started with " << pool_.workerCount() << " workers\n";
+    }
+
+    void stop() {
+        pool_.stop();
+        std::cout << "[FileIOThreadPool] Stopped (saved: " << stats_.files_saved << " files)\n";
+    }
+
+    void enqueueSegment(SegmentData segment) {
+        pool_.submit([this, seg = std::move(segment)]() mutable {
+            saveSegment(seg);
+        });
+    }
+
+    size_t pendingCount() const {
+        return pool_.pendingTasks();
+    }
+
+private:
     void saveSegment(const SegmentData& segment) {
+        auto start_time = std::chrono::high_resolution_clock::now();
+
         std::ostringstream filename;
         filename << "segment_" << std::setfill('0') << std::setw(4) << segment.segment_id << ".json";
 
@@ -184,28 +297,101 @@ private:
         if (file.is_open()) {
             file << JsonWriter::segmentToJson(segment);
             file.close();
+            stats_.files_saved++;
         } else {
-            std::cerr << "[FileIOThread] Failed to save: " << filepath << "\n";
+            std::cerr << "[FileIOThreadPool] Failed to save: " << filepath << "\n";
         }
+
+        auto end_time = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+        stats_.avg_save_time_us = duration.count();
     }
 
     std::string segments_dir_;
-    std::atomic<bool> running_;
-    std::thread thread_;
-    ThreadSafeQueue<SegmentData> save_queue_;
+    ThreadStats& stats_;
+    ThreadPool<std::function<void()>> pool_;
 };
 
 // =============================================================================
-// SAMPLING THREAD (125Hz Mouse Polling)
+// EVENT PROCESSING THREAD - Decoupled Event Handling
+// =============================================================================
+
+class EventProcessingThread {
+public:
+    using EventHandler = std::function<void(const MouseEvent&)>;
+
+    EventProcessingThread(ThreadStats& stats)
+        : stats_(stats), running_(false) {}
+
+    ~EventProcessingThread() {
+        stop();
+    }
+
+    void start() {
+        running_ = true;
+        thread_ = std::thread(&EventProcessingThread::run, this);
+        ThreadUtils::setThreadName("Events");
+        std::cout << "[EventProcessingThread] Started\n";
+    }
+
+    void stop() {
+        running_ = false;
+        event_queue_.shutdown();
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+        std::cout << "[EventProcessingThread] Stopped (processed: " << stats_.events_processed << ")\n";
+    }
+
+    void pushEvent(MouseEvent event) {
+        event_queue_.push(std::move(event));
+    }
+
+    void setHandler(EventHandler handler) {
+        handler_ = std::move(handler);
+    }
+
+    size_t pendingCount() const {
+        return event_queue_.size();
+    }
+
+private:
+    void run() {
+        while (running_) {
+            MouseEvent event;
+            if (event_queue_.pop(event, 20)) {
+                if (handler_) {
+                    handler_(event);
+                    stats_.events_processed++;
+                }
+            }
+        }
+
+        // Drain remaining events
+        MouseEvent event;
+        while (event_queue_.pop(event, 0)) {
+            if (handler_) {
+                handler_(event);
+                stats_.events_processed++;
+            }
+        }
+    }
+
+    ThreadStats& stats_;
+    std::atomic<bool> running_;
+    std::thread thread_;
+    ThreadSafeQueue<MouseEvent> event_queue_;
+    EventHandler handler_;
+};
+
+// =============================================================================
+// SAMPLING THREAD (125Hz Mouse Polling) - Enhanced with Ring Buffer
 // =============================================================================
 
 class SamplingThread {
 public:
-    using MouseCallback = std::function<void(int64_t, int, int)>;
-    using EntryCallback = std::function<void(RecorderEvent, int64_t, int, int)>;
-
-    SamplingThread()
-        : running_(false), recording_enabled_(false), session_start_time_(0) {}
+    SamplingThread(ThreadStats& stats)
+        : stats_(stats), running_(false), recording_enabled_(false), session_start_time_(0) {}
 
     ~SamplingThread() {
         stop();
@@ -215,6 +401,7 @@ public:
         session_start_time_ = session_start;
         running_ = true;
         thread_ = std::thread(&SamplingThread::run, this);
+        ThreadUtils::setThreadName("Sampling");
         std::cout << "[SamplingThread] Started at " << Config::SAMPLE_RATE_HZ << "Hz\n";
     }
 
@@ -223,7 +410,7 @@ public:
         if (thread_.joinable()) {
             thread_.join();
         }
-        std::cout << "[SamplingThread] Stopped\n";
+        std::cout << "[SamplingThread] Stopped (samples: " << stats_.samples_processed << ")\n";
     }
 
     void setRecordingEnabled(bool enabled) {
@@ -236,18 +423,16 @@ public:
         dot_B_ = B;
     }
 
-    void setCallbacks(MouseCallback mouse_cb, EntryCallback entry_cb) {
-        mouse_callback_ = mouse_cb;
-        entry_callback_ = entry_cb;
+    void setCallbacks(MouseSampleCallback mouse_cb, EntryEventCallback entry_cb) {
+        mouse_callback_ = std::move(mouse_cb);
+        entry_callback_ = std::move(entry_cb);
     }
 
     void setWindowPosition(int x, int y) {
-        std::lock_guard<std::mutex> lock(window_mutex_);
-        window_x_ = x;
-        window_y_ = y;
+        window_x_.store(x, std::memory_order_relaxed);
+        window_y_.store(y, std::memory_order_relaxed);
     }
 
-    // Reset entry detection state
     void resetEntryState() {
         inside_A_ = false;
         inside_B_ = false;
@@ -258,23 +443,19 @@ public:
 
 private:
     void run() {
-        const double interval_sec = 1.0 / Config::SAMPLE_RATE_HZ;
+        const auto interval = std::chrono::nanoseconds(static_cast<int64_t>(1e9 / Config::SAMPLE_RATE_HZ));
         auto next_time = std::chrono::high_resolution_clock::now();
 
         while (running_) {
-            auto now = std::chrono::high_resolution_clock::now();
+            auto sample_start = std::chrono::high_resolution_clock::now();
 
             // Get mouse position
             int mouse_x, mouse_y;
             SDL_GetGlobalMouseState(&mouse_x, &mouse_y);
 
             // Convert to canvas coordinates
-            int win_x, win_y;
-            {
-                std::lock_guard<std::mutex> lock(window_mutex_);
-                win_x = window_x_;
-                win_y = window_y_;
-            }
+            int win_x = window_x_.load(std::memory_order_relaxed);
+            int win_y = window_y_.load(std::memory_order_relaxed);
 
             int canvas_x = mouse_x - win_x;
             int canvas_y = mouse_y - win_y;
@@ -292,16 +473,31 @@ private:
                 if (recording_enabled_ && mouse_callback_) {
                     mouse_callback_(timestamp, canvas_x, canvas_y);
                 }
+
+                stats_.samples_processed++;
             }
 
-            // Sleep until next sample
-            next_time += std::chrono::duration_cast<std::chrono::high_resolution_clock::duration>(
-                std::chrono::duration<double>(interval_sec));
+            // Measure latency
+            auto sample_end = std::chrono::high_resolution_clock::now();
+            auto latency = std::chrono::duration_cast<std::chrono::microseconds>(sample_end - sample_start);
+            stats_.avg_sample_latency_us = latency.count();
 
+            // Precise timing for next sample
+            next_time += interval;
             auto sleep_time = next_time - std::chrono::high_resolution_clock::now();
+
             if (sleep_time.count() > 0) {
-                std::this_thread::sleep_for(sleep_time);
+                // Use hybrid sleep: OS sleep for most, then busy-wait for precision
+                auto sleep_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(sleep_time);
+                if (sleep_ns > std::chrono::microseconds(500)) {
+                    std::this_thread::sleep_for(sleep_ns - std::chrono::microseconds(200));
+                }
+                // Busy-wait for final precision
+                while (std::chrono::high_resolution_clock::now() < next_time) {
+                    std::this_thread::yield();
+                }
             } else {
+                // We're behind, reset timing
                 next_time = std::chrono::high_resolution_clock::now();
             }
         }
@@ -350,6 +546,7 @@ private:
         }
     }
 
+    ThreadStats& stats_;
     std::atomic<bool> running_;
     std::atomic<bool> recording_enabled_;
     std::thread thread_;
@@ -361,19 +558,18 @@ private:
     Dot dot_A_;
     Dot dot_B_;
 
-    std::mutex window_mutex_;
-    int window_x_ = 0;
-    int window_y_ = 0;
+    std::atomic<int> window_x_{0};
+    std::atomic<int> window_y_{0};
 
     std::atomic<bool> inside_A_{false};
     std::atomic<bool> inside_B_{false};
 
-    MouseCallback mouse_callback_;
-    EntryCallback entry_callback_;
+    MouseSampleCallback mouse_callback_;
+    EntryEventCallback entry_callback_;
 };
 
 // =============================================================================
-// BALANCED THREE-DOT RECORDER (Main Class)
+// BALANCED THREE-DOT RECORDER (Main Class) - Enhanced Threading
 // =============================================================================
 
 class BalancedThreeDotRecorder {
@@ -396,23 +592,7 @@ public:
         segments_dir_ = output_dir_ / "segments";
         fs::create_directories(segments_dir_);
 
-        std::cout << "\n" << std::string(60, '=') << "\n";
-        std::cout << "BALANCED THREE-DOT RECORDER v8.0.0 (C++)\n";
-        std::cout << std::string(60, '=') << "\n";
-        std::cout << "Session ID: " << session_id_ << "\n";
-        std::cout << "Precomputed path: " << target_segments_ << " segments\n";
-        std::cout << "Coverage: 96 (dist x orient) combos x 2 = 192 segments\n";
-        std::cout << "Turn categories: 7 types, ~27-28 each\n";
-        std::cout << "\nThreads:\n";
-        std::cout << "  - Main Thread: Rendering & Events\n";
-        std::cout << "  - Sampling Thread: " << Config::SAMPLE_RATE_HZ << "Hz mouse polling\n";
-        std::cout << "  - File I/O Thread: Async JSON saving\n";
-        std::cout << "\nInstructions:\n";
-        std::cout << "  1. Pass through GREEN dot (A) - recording starts\n";
-        std::cout << "  2. Move to BLUE dot (B) - see ORANGE dot (C) as NEXT target\n";
-        std::cout << "  3. Pass through BLUE dot (B) - segment completes\n";
-        std::cout << "  4. Press ESC to end early\n";
-        std::cout << std::string(60, '=') << "\n";
+        printBanner();
     }
 
     ~BalancedThreeDotRecorder() {
@@ -434,7 +614,7 @@ public:
 
         // Create window
         window_ = SDL_CreateWindow(
-            "SapiAgent Balanced Recorder v8.0.0 (C++)",
+            "SapiAgent Balanced Recorder v8.1.0 (C++ Enhanced Threading)",
             SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
             Config::SCREEN_WIDTH, Config::SCREEN_HEIGHT,
             SDL_WINDOW_SHOWN
@@ -444,14 +624,182 @@ public:
             return false;
         }
 
-        // Create renderer
+        // Create renderer with VSync
         renderer_ = SDL_CreateRenderer(window_, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
         if (!renderer_) {
             std::cerr << "Renderer creation failed: " << SDL_GetError() << "\n";
             return false;
         }
 
-        // Load font (try common system fonts)
+        // Load font
+        loadFont();
+
+        // Initialize thread components
+        initializeThreads();
+
+        return true;
+    }
+
+    void run() {
+        // Show countdown
+        showStartupCountdown(5);
+
+        // Start session and all threads
+        startSession();
+
+        // Main render loop (Thread 1)
+        SDL_Event event;
+        auto last_stats_time = std::chrono::steady_clock::now();
+
+        while (is_active_) {
+            // Handle SDL events
+            while (SDL_PollEvent(&event)) {
+                handleSDLEvent(event);
+            }
+
+            // Update window position for sampling thread
+            int wx, wy;
+            SDL_GetWindowPosition(window_, &wx, &wy);
+            sampling_thread_->setWindowPosition(wx, wy);
+
+            // Process events from event thread
+            processMainThreadEvents();
+
+            // Render
+            render();
+
+            // Print stats every 5 seconds
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::seconds>(now - last_stats_time).count() >= 5) {
+                printThreadStats();
+                last_stats_time = now;
+            }
+        }
+
+        // Show completion
+        showCompletionScreen();
+        SDL_Delay(5000);
+    }
+
+private:
+    void printBanner() {
+        std::cout << "\n" << std::string(70, '=') << "\n";
+        std::cout << "BALANCED THREE-DOT RECORDER v8.1.0 (C++ Enhanced Multi-Threading)\n";
+        std::cout << std::string(70, '=') << "\n";
+        std::cout << "Session ID: " << session_id_ << "\n";
+        std::cout << "Precomputed path: " << target_segments_ << " segments\n";
+        std::cout << "Hardware threads: " << ThreadUtils::getHardwareThreads() << "\n";
+        std::cout << "\nThread Architecture (6 threads optimized for i5-10600K):\n";
+        std::cout << "  [1] Main Thread      - SDL2 rendering & window management\n";
+        std::cout << "  [2] Event Thread     - Decoupled event processing\n";
+        std::cout << "  [3] Sampling Thread  - " << Config::SAMPLE_RATE_HZ << "Hz mouse polling\n";
+        std::cout << "  [4] Compute Thread   - Segment metadata calculations\n";
+        std::cout << "  [5-6] File I/O Pool  - " << Config::FILE_IO_WORKER_COUNT << " parallel JSON writers\n";
+        std::cout << "\nInstructions:\n";
+        std::cout << "  1. Pass through GREEN dot (A) - recording starts\n";
+        std::cout << "  2. Move to BLUE dot (B) - see ORANGE dot (C) as NEXT target\n";
+        std::cout << "  3. Pass through BLUE dot (B) - segment completes\n";
+        std::cout << "  4. Press ESC to end early\n";
+        std::cout << std::string(70, '=') << "\n\n";
+    }
+
+    void initializeThreads() {
+        // Create thread components
+        event_thread_ = std::make_unique<EventProcessingThread>(stats_);
+        sampling_thread_ = std::make_unique<SamplingThread>(stats_);
+        compute_thread_ = std::make_unique<ComputationThread>(stats_);
+        file_io_pool_ = std::make_unique<FileIOThreadPool>(
+            segments_dir_.string(), Config::FILE_IO_WORKER_COUNT, stats_);
+
+        // Wire up callbacks
+
+        // Event thread handles entry events
+        event_thread_->setHandler([this](const MouseEvent& evt) {
+            std::lock_guard<std::mutex> lock(main_event_mutex_);
+            main_event_queue_.push(evt);
+        });
+
+        // Sampling thread sends events to event thread
+        sampling_thread_->setCallbacks(
+            [this](int64_t ts, int x, int y) { onMouseSample(ts, x, y); },
+            [this](RecorderEvent e, int64_t ts, int x, int y) {
+                event_thread_->pushEvent({ts, x, y, e});
+            }
+        );
+
+        // Compute thread sends completed segments to file I/O
+        compute_thread_->setOutputCallback([this](SegmentData seg) {
+            file_io_pool_->enqueueSegment(std::move(seg));
+        });
+
+        std::cout << "[Main] All thread components initialized\n";
+    }
+
+    void startSession() {
+        session_start_time_ = Helpers::getCurrentTimeMs();
+        is_active_ = true;
+
+        // Spawn initial dots
+        spawnInitialDots();
+
+        // Start all threads
+        event_thread_->start();
+        sampling_thread_->start(session_start_time_);
+        compute_thread_->start();
+        file_io_pool_->start();
+
+        // Configure sampling thread
+        sampling_thread_->setDots(dot_A_, dot_B_);
+
+        std::cout << "[Main] Session started - all threads running\n";
+    }
+
+    void endSession() {
+        is_active_ = false;
+        recording_enabled_ = false;
+        sampling_thread_->setRecordingEnabled(false);
+
+        // Stop threads in order
+        sampling_thread_->stop();
+        event_thread_->stop();
+        compute_thread_->stop();
+        file_io_pool_->stop();
+
+        std::cout << "\n" << std::string(70, '=') << "\n";
+        std::cout << "SESSION COMPLETE\n";
+        std::cout << std::string(70, '=') << "\n";
+        std::cout << "  Segments recorded: " << segments_recorded_ << "/" << target_segments_ << "\n";
+        std::cout << "  Output directory: " << output_dir_ << "\n";
+        printThreadStats();
+    }
+
+    void printThreadStats() {
+        std::cout << "\n[Thread Statistics]\n";
+        std::cout << "  Samples processed:  " << stats_.samples_processed << "\n";
+        std::cout << "  Events processed:   " << stats_.events_processed << "\n";
+        std::cout << "  Segments computed:  " << stats_.segments_computed << "\n";
+        std::cout << "  Files saved:        " << stats_.files_saved << "\n";
+        std::cout << "  Avg sample latency: " << stats_.avg_sample_latency_us << " us\n";
+        std::cout << "  Avg compute time:   " << stats_.avg_compute_time_us << " us\n";
+        std::cout << "  Avg save time:      " << stats_.avg_save_time_us << " us\n";
+        std::cout << "  Pending compute:    " << compute_thread_->pendingCount() << "\n";
+        std::cout << "  Pending file I/O:   " << file_io_pool_->pendingCount() << "\n";
+    }
+
+    void cleanup() {
+        if (sampling_thread_) sampling_thread_->stop();
+        if (event_thread_) event_thread_->stop();
+        if (compute_thread_) compute_thread_->stop();
+        if (file_io_pool_) file_io_pool_->stop();
+
+        if (font_) TTF_CloseFont(font_);
+        if (renderer_) SDL_DestroyRenderer(renderer_);
+        if (window_) SDL_DestroyWindow(window_);
+        TTF_Quit();
+        SDL_Quit();
+    }
+
+    void loadFont() {
         const char* font_paths[] = {
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
             "/usr/share/fonts/TTF/DejaVuSans.ttf",
@@ -467,116 +815,35 @@ public:
         }
 
         if (!font_) {
-            std::cerr << "Warning: Could not load any font, text will not display\n";
+            std::cerr << "Warning: Could not load any font\n";
         }
-
-        // Initialize file I/O thread
-        file_io_thread_ = std::make_unique<FileIOThread>(segments_dir_.string());
-        file_io_thread_->start();
-
-        // Initialize sampling thread
-        sampling_thread_ = std::make_unique<SamplingThread>();
-        sampling_thread_->setCallbacks(
-            [this](int64_t ts, int x, int y) { this->onMouseSample(ts, x, y); },
-            [this](RecorderEvent e, int64_t ts, int x, int y) { this->onEntryEvent(e, ts, x, y); }
-        );
-
-        return true;
-    }
-
-    void run() {
-        // Show countdown
-        showStartupCountdown(5);
-
-        // Start session
-        startSession();
-
-        // Main event loop
-        SDL_Event event;
-        while (is_active_) {
-            while (SDL_PollEvent(&event)) {
-                handleEvent(event);
-            }
-
-            // Update window position for sampling thread
-            int wx, wy;
-            SDL_GetWindowPosition(window_, &wx, &wy);
-            sampling_thread_->setWindowPosition(wx, wy);
-
-            // Render
-            render();
-
-            // Cap frame rate
-            SDL_Delay(16);  // ~60 FPS
-        }
-
-        // Show completion
-        showCompletionScreen();
-        SDL_Delay(5000);
-    }
-
-private:
-    void cleanup() {
-        if (sampling_thread_) {
-            sampling_thread_->stop();
-        }
-        if (file_io_thread_) {
-            file_io_thread_->stop();
-        }
-
-        if (font_) TTF_CloseFont(font_);
-        if (renderer_) SDL_DestroyRenderer(renderer_);
-        if (window_) SDL_DestroyWindow(window_);
-        TTF_Quit();
-        SDL_Quit();
     }
 
     void showStartupCountdown(int seconds) {
         for (int i = seconds; i > 0; --i) {
-            // Clear screen
             SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
             SDL_RenderClear(renderer_);
 
-            // Render countdown text
-            renderText("BALANCED THREE-DOT RECORDER", Config::SCREEN_WIDTH / 2, Config::SCREEN_HEIGHT / 2 - 80,
-                      {255, 255, 255, 255}, true);
+            renderText("BALANCED THREE-DOT RECORDER v8.1.0",
+                       Config::SCREEN_WIDTH / 2, Config::SCREEN_HEIGHT / 2 - 100,
+                       {255, 255, 255, 255}, true);
+
+            renderText("Enhanced 6-Thread Architecture",
+                       Config::SCREEN_WIDTH / 2, Config::SCREEN_HEIGHT / 2 - 60,
+                       {100, 100, 100, 255}, true);
 
             std::ostringstream ss;
             ss << "Starting in " << i << "...";
             renderText(ss.str(), Config::SCREEN_WIDTH / 2, Config::SCREEN_HEIGHT / 2,
-                      {59, 130, 246, 255}, true);
+                       {59, 130, 246, 255}, true);
 
             renderText("Following precomputed path for balanced coverage",
-                      Config::SCREEN_WIDTH / 2, Config::SCREEN_HEIGHT / 2 + 60,
-                      {128, 128, 128, 255}, true);
+                       Config::SCREEN_WIDTH / 2, Config::SCREEN_HEIGHT / 2 + 60,
+                       {128, 128, 128, 255}, true);
 
             SDL_RenderPresent(renderer_);
             SDL_Delay(1000);
         }
-    }
-
-    void startSession() {
-        session_start_time_ = Helpers::getCurrentTimeMs();
-        is_active_ = true;
-
-        // Spawn initial dots
-        spawnInitialDots();
-
-        // Start sampling thread
-        sampling_thread_->start(session_start_time_);
-        sampling_thread_->setDots(dot_A_, dot_B_);
-    }
-
-    void endSession() {
-        is_active_ = false;
-        recording_enabled_ = false;
-        sampling_thread_->setRecordingEnabled(false);
-
-        std::cout << "\n" << std::string(60, '=') << "\n";
-        std::cout << "SESSION COMPLETE\n";
-        std::cout << std::string(60, '=') << "\n";
-        std::cout << "  Segments recorded: " << segments_recorded_ << "/" << target_segments_ << "\n";
-        std::cout << "  Output directory: " << output_dir_ << "\n";
     }
 
     void showCompletionScreen() {
@@ -584,32 +851,30 @@ private:
         SDL_RenderClear(renderer_);
 
         renderText("SESSION COMPLETE", Config::SCREEN_WIDTH / 2, Config::SCREEN_HEIGHT / 2 - 60,
-                  {34, 197, 94, 255}, true);
+                   {34, 197, 94, 255}, true);
 
         std::ostringstream ss;
         double pct = 100.0 * segments_recorded_ / target_segments_;
-        ss << segments_recorded_ << "/" << target_segments_ << " segments (" << std::fixed << std::setprecision(0) << pct << "% coverage)";
+        ss << segments_recorded_ << "/" << target_segments_ << " segments ("
+           << std::fixed << std::setprecision(0) << pct << "% coverage)";
         renderText(ss.str(), Config::SCREEN_WIDTH / 2, Config::SCREEN_HEIGHT / 2 + 20,
-                  {255, 255, 255, 255}, true);
+                   {255, 255, 255, 255}, true);
 
         ss.str("");
         ss << "Saved to: " << output_dir_.string();
         renderText(ss.str(), Config::SCREEN_WIDTH / 2, Config::SCREEN_HEIGHT / 2 + 80,
-                  {128, 128, 128, 255}, true);
+                   {128, 128, 128, 255}, true);
 
         SDL_RenderPresent(renderer_);
     }
 
     void spawnInitialDots() {
-        // A starts at first position in path
         const auto& first = (*precomputed_path_)[0];
         dot_A_.x = first.start_x;
         dot_A_.y = first.start_y;
 
-        // B is the target for first segment
         dot_B_ = getDotFromPath(0);
 
-        // C is the target for second segment
         if (precomputed_path_->size() > 1) {
             dot_C_ = getDotFromPath(1);
         } else {
@@ -625,8 +890,6 @@ private:
         }
 
         const auto& seg = (*precomputed_path_)[index];
-
-        // Compute target position
         auto it = Orientation::VECTORS.find(seg.orientation);
         double dx = it->second.x;
         double dy = it->second.y;
@@ -651,25 +914,20 @@ private:
             return;
         }
 
-        // A becomes current B position
         dot_A_.x = dot_B_.x;
         dot_A_.y = dot_B_.y;
-
-        // B becomes current C
         dot_B_ = dot_C_;
 
-        // C becomes next target
         if (path_index_ + 1 < precomputed_path_->size()) {
             dot_C_ = getDotFromPath(path_index_ + 1);
         } else {
             dot_C_ = dot_B_;
         }
 
-        // Update sampling thread
         sampling_thread_->setDots(dot_A_, dot_B_);
     }
 
-    void handleEvent(const SDL_Event& event) {
+    void handleSDLEvent(const SDL_Event& event) {
         if (event.type == SDL_QUIT) {
             endSession();
         } else if (event.type == SDL_KEYDOWN) {
@@ -690,24 +948,11 @@ private:
         }
     }
 
-    // Called from sampling thread
-    void onMouseSample(int64_t timestamp, int x, int y) {
-        std::lock_guard<std::mutex> lock(trajectory_mutex_);
-        current_trajectory_.push_back({timestamp, x, y});
-    }
-
-    // Called from sampling thread (via event queue for thread safety)
-    void onEntryEvent(RecorderEvent event, int64_t timestamp, int x, int y) {
-        // Queue event for main thread
-        std::lock_guard<std::mutex> lock(event_mutex_);
-        pending_events_.push({timestamp, x, y, event});
-    }
-
-    void processPendingEvents() {
-        std::lock_guard<std::mutex> lock(event_mutex_);
-        while (!pending_events_.empty()) {
-            MouseEvent evt = pending_events_.front();
-            pending_events_.pop();
+    void processMainThreadEvents() {
+        std::lock_guard<std::mutex> lock(main_event_mutex_);
+        while (!main_event_queue_.empty()) {
+            MouseEvent evt = main_event_queue_.front();
+            main_event_queue_.pop();
 
             if (evt.event_type == RecorderEvent::StartRecording) {
                 startRecording(evt.timestamp, evt.x, evt.y);
@@ -715,6 +960,11 @@ private:
                 completeSegment(evt.timestamp, evt.x, evt.y);
             }
         }
+    }
+
+    void onMouseSample(int64_t timestamp, int x, int y) {
+        std::lock_guard<std::mutex> lock(trajectory_mutex_);
+        current_trajectory_.push_back({timestamp, x, y});
     }
 
     void startRecording(int64_t timestamp, int x, int y) {
@@ -744,47 +994,18 @@ private:
             trajectory = current_trajectory_;
         }
 
-        // Build segment data
-        SegmentData segment;
-        segment.segment_id = segments_recorded_ + 1;
-        segment.timestamp_start = segment_start_time_;
-        segment.timestamp_end = timestamp;
-        segment.duration_ms = timestamp - segment_start_time_;
+        // Create raw segment for computation thread
+        RawSegmentData raw;
+        raw.segment_id = segments_recorded_ + 1;
+        raw.timestamp_start = segment_start_time_;
+        raw.timestamp_end = timestamp;
+        raw.dot_A = dot_A_;
+        raw.dot_B = dot_B_;
+        raw.dot_C = dot_C_;
+        raw.trajectory = std::move(trajectory);
 
-        segment.dot_A = dot_A_;
-        segment.dot_B = dot_B_;
-        segment.dot_C = dot_C_;
-
-        // Compute AB metrics
-        double vec_AB_x = dot_B_.x - dot_A_.x;
-        double vec_AB_y = dot_B_.y - dot_A_.y;
-        segment.ab_distance = std::hypot(vec_AB_x, vec_AB_y);
-        segment.ab_angle_deg = Helpers::rad2deg(std::atan2(vec_AB_y, vec_AB_x));
-        segment.ab_orientation = Helpers::getOrientationFromAngle(segment.ab_angle_deg);
-        segment.ab_orientation_id = Helpers::getOrientationId(segment.ab_orientation);
-        auto [ab_group, ab_name] = Helpers::getDistanceGroup(segment.ab_distance);
-        segment.ab_distance_group = ab_group;
-        segment.ab_distance_name = ab_name;
-
-        // Compute BC metrics
-        double vec_BC_x = dot_C_.x - dot_B_.x;
-        double vec_BC_y = dot_C_.y - dot_B_.y;
-        segment.bc_distance = std::hypot(vec_BC_x, vec_BC_y);
-        segment.bc_angle_deg = Helpers::rad2deg(std::atan2(vec_BC_y, vec_BC_x));
-        segment.bc_orientation = Helpers::getOrientationFromAngle(segment.bc_angle_deg);
-        segment.bc_orientation_id = Helpers::getOrientationId(segment.bc_orientation);
-        auto [bc_group, bc_name] = Helpers::getDistanceGroup(segment.bc_distance);
-        segment.bc_distance_group = bc_group;
-        segment.bc_distance_name = bc_name;
-
-        // Compute turn
-        segment.turn_angle_deg = Helpers::angleBetweenVectors(vec_AB_x, vec_AB_y, vec_BC_x, vec_BC_y);
-        segment.turn_category = Helpers::getTurnCategory(segment.turn_angle_deg);
-
-        segment.trajectory = trajectory;
-
-        // Enqueue for saving
-        file_io_thread_->enqueueSegment(segment);
+        // Send to computation thread (non-blocking)
+        compute_thread_->enqueue(std::move(raw));
 
         segments_recorded_++;
         std::cout << "[Recording] Completed segment " << segments_recorded_ << "/" << target_segments_ << "\n";
@@ -800,7 +1021,7 @@ private:
         // Shift dots
         shiftDots();
 
-        // Reset entry detection but stay recording
+        // Reset entry detection
         sampling_thread_->setInsideA(true);
         sampling_thread_->setInsideB(false);
 
@@ -814,9 +1035,6 @@ private:
     }
 
     void render() {
-        // Process pending events from sampling thread
-        processPendingEvents();
-
         // Clear
         SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
         SDL_RenderClear(renderer_);
@@ -837,7 +1055,7 @@ private:
         b_label << "B (" << dot_B_.distance << "px " << dot_B_.orientation << ")";
         renderText(b_label.str(), dot_B_.x, dot_B_.y - Config::DOT_RADIUS - 10, {59, 130, 246, 255}, true);
 
-        // Draw A (origin) - Green (lighter if recording)
+        // Draw A (origin) - Green
         SDL_Color a_color = recording_enabled_ ? SDL_Color{144, 238, 144, 255} : SDL_Color{34, 197, 94, 255};
         drawFilledCircle(dot_A_.x, dot_A_.y, Config::DOT_RADIUS, a_color);
         std::string a_label = recording_enabled_ ? "A (recording...)" : "A (pass through)";
@@ -847,6 +1065,14 @@ private:
         std::ostringstream progress;
         progress << segments_recorded_ << "/" << target_segments_;
         renderText(progress.str(), Config::SCREEN_WIDTH / 2, 25, {128, 128, 128, 255}, true);
+
+        // Draw thread status
+        std::ostringstream thread_status;
+        thread_status << "Threads: Sampling=" << stats_.samples_processed
+                      << " Compute=" << stats_.segments_computed
+                      << " Saved=" << stats_.files_saved;
+        renderText(thread_status.str(), Config::SCREEN_WIDTH / 2, Config::SCREEN_HEIGHT - 25,
+                   {80, 80, 80, 255}, true);
 
         SDL_RenderPresent(renderer_);
     }
@@ -917,13 +1143,18 @@ private:
     std::mutex trajectory_mutex_;
     std::vector<TrajectoryPoint> current_trajectory_;
 
-    // Event queue from sampling thread
-    std::mutex event_mutex_;
-    std::queue<MouseEvent> pending_events_;
+    // Main thread event queue (from event processing thread)
+    std::mutex main_event_mutex_;
+    std::queue<MouseEvent> main_event_queue_;
 
     // Thread components
+    std::unique_ptr<EventProcessingThread> event_thread_;
     std::unique_ptr<SamplingThread> sampling_thread_;
-    std::unique_ptr<FileIOThread> file_io_thread_;
+    std::unique_ptr<ComputationThread> compute_thread_;
+    std::unique_ptr<FileIOThreadPool> file_io_pool_;
+
+    // Thread statistics
+    ThreadStats stats_;
 };
 
 // =============================================================================
@@ -931,7 +1162,11 @@ private:
 // =============================================================================
 
 int main(int argc, char* argv[]) {
-    std::cout << "SapiAgent Balanced Recorder v8.0.0 (C++ Multi-threaded)\n";
+    (void)argc;
+    (void)argv;
+
+    std::cout << "SapiAgent Balanced Recorder v8.1.0\n";
+    std::cout << "Enhanced 6-Thread Architecture for Intel i5-10600K\n";
     std::cout << "========================================================\n\n";
 
     BalancedThreeDotRecorder recorder;

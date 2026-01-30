@@ -1,13 +1,17 @@
 /**
  * SapiAgent Three-Dot Flow Recorder - BALANCED VERSION (C++)
- * Version: 8.0.0 - PRECOMPUTED BALANCED PATH
+ * Version: 8.1.0 - ENHANCED MULTI-THREADED ARCHITECTURE
  *
- * Multi-threaded C++ implementation with dedicated threads for:
- * - Main Thread: Window management, rendering, event handling
- * - Sampling Thread: 125Hz mouse position polling
- * - File I/O Thread: Asynchronous segment JSON saving
+ * Optimized for Intel i5-10600K (6 cores / 12 threads)
  *
- * Dependencies: SDL2, nlohmann/json
+ * Thread Architecture (6 threads):
+ * - Thread 1: Main Thread - SDL2 rendering & window management
+ * - Thread 2: Event Processing Thread - Decoupled event handling
+ * - Thread 3: Sampling Thread - 125Hz mouse position polling
+ * - Thread 4: Computation Thread - Segment metadata calculations
+ * - Thread 5-6: File I/O Thread Pool - Parallel JSON saving (2 workers)
+ *
+ * Dependencies: SDL2, SDL2_ttf
  */
 
 #ifndef SAPI_RECORDER_BALANCED_HPP
@@ -26,6 +30,7 @@
 #include <chrono>
 #include <memory>
 #include <functional>
+#include <shared_mutex>
 
 // =============================================================================
 // CONFIGURATION CONSTANTS
@@ -62,6 +67,17 @@ namespace Config {
 
     // Path count for random selection
     constexpr int PATH_COUNT = 15;
+
+    // Enhanced Threading Configuration (optimized for i5-10600K: 6 cores / 12 threads)
+    constexpr int FILE_IO_WORKER_COUNT = 2;      // Parallel file writers
+    constexpr int COMPUTATION_QUEUE_SIZE = 32;   // Max pending computations
+    constexpr int EVENT_QUEUE_SIZE = 64;         // Max pending events
+
+    // Thread priorities (platform-specific, hint only)
+    constexpr int PRIORITY_SAMPLING = 2;    // Highest - timing critical
+    constexpr int PRIORITY_EVENT = 1;       // High - responsiveness
+    constexpr int PRIORITY_COMPUTE = 0;     // Normal
+    constexpr int PRIORITY_FILE_IO = -1;    // Lower - background work
 }
 
 // =============================================================================
@@ -203,6 +219,36 @@ struct SegmentData {
 
     // Trajectory
     std::vector<TrajectoryPoint> trajectory;
+
+    // Processing state
+    bool computed = false;
+};
+
+// Raw segment data (before computation) - passed from main to computation thread
+struct RawSegmentData {
+    int segment_id;
+    int64_t timestamp_start;
+    int64_t timestamp_end;
+
+    Dot dot_A;
+    Dot dot_B;
+    Dot dot_C;
+
+    std::vector<TrajectoryPoint> trajectory;
+};
+
+// Thread statistics for monitoring
+struct ThreadStats {
+    std::atomic<uint64_t> samples_processed{0};
+    std::atomic<uint64_t> events_processed{0};
+    std::atomic<uint64_t> segments_computed{0};
+    std::atomic<uint64_t> files_saved{0};
+    std::atomic<uint64_t> queue_overflows{0};
+
+    // Timing stats (in microseconds)
+    std::atomic<uint64_t> avg_sample_latency_us{0};
+    std::atomic<uint64_t> avg_compute_time_us{0};
+    std::atomic<uint64_t> avg_save_time_us{0};
 };
 
 // =============================================================================
@@ -254,11 +300,155 @@ public:
         return queue_.size();
     }
 
+    void clear() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::queue<T> empty;
+        std::swap(queue_, empty);
+    }
+
+    bool isShutdown() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return shutdown_;
+    }
+
 private:
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     std::queue<T> queue_;
     bool shutdown_ = false;
+};
+
+// =============================================================================
+// THREAD POOL (For parallel file I/O)
+// =============================================================================
+
+template<typename Task>
+class ThreadPool {
+public:
+    explicit ThreadPool(size_t num_workers, const std::string& name = "Worker")
+        : name_(name), running_(false) {
+        workers_.reserve(num_workers);
+    }
+
+    ~ThreadPool() {
+        stop();
+    }
+
+    void start() {
+        running_ = true;
+        for (size_t i = 0; i < workers_.capacity(); ++i) {
+            workers_.emplace_back(&ThreadPool::workerLoop, this, i);
+        }
+        std::cout << "[ThreadPool:" << name_ << "] Started " << workers_.size() << " workers\n";
+    }
+
+    void stop() {
+        running_ = false;
+        task_queue_.shutdown();
+        for (auto& worker : workers_) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+        workers_.clear();
+        std::cout << "[ThreadPool:" << name_ << "] Stopped\n";
+    }
+
+    void submit(Task task) {
+        if (running_) {
+            task_queue_.push(std::move(task));
+        }
+    }
+
+    size_t pendingTasks() const {
+        return task_queue_.size();
+    }
+
+    size_t workerCount() const {
+        return workers_.size();
+    }
+
+private:
+    void workerLoop(size_t worker_id) {
+        while (running_) {
+            Task task;
+            if (task_queue_.pop(task, 100)) {
+                try {
+                    task();
+                } catch (const std::exception& e) {
+                    std::cerr << "[ThreadPool:" << name_ << ":Worker" << worker_id
+                              << "] Exception: " << e.what() << "\n";
+                }
+            }
+        }
+
+        // Drain remaining tasks
+        Task task;
+        while (task_queue_.pop(task, 0)) {
+            try {
+                task();
+            } catch (...) {}
+        }
+    }
+
+    std::string name_;
+    std::atomic<bool> running_;
+    std::vector<std::thread> workers_;
+    ThreadSafeQueue<Task> task_queue_;
+};
+
+// =============================================================================
+// LOCK-FREE SPSC RING BUFFER (For high-frequency sampling data)
+// =============================================================================
+
+template<typename T, size_t Capacity>
+class SPSCRingBuffer {
+    static_assert((Capacity & (Capacity - 1)) == 0, "Capacity must be power of 2");
+
+public:
+    SPSCRingBuffer() : head_(0), tail_(0) {
+        buffer_.resize(Capacity);
+    }
+
+    bool push(const T& item) {
+        size_t head = head_.load(std::memory_order_relaxed);
+        size_t next_head = (head + 1) & (Capacity - 1);
+
+        if (next_head == tail_.load(std::memory_order_acquire)) {
+            return false;  // Full
+        }
+
+        buffer_[head] = item;
+        head_.store(next_head, std::memory_order_release);
+        return true;
+    }
+
+    bool pop(T& item) {
+        size_t tail = tail_.load(std::memory_order_relaxed);
+
+        if (tail == head_.load(std::memory_order_acquire)) {
+            return false;  // Empty
+        }
+
+        item = buffer_[tail];
+        tail_.store((tail + 1) & (Capacity - 1), std::memory_order_release);
+        return true;
+    }
+
+    bool empty() const {
+        return head_.load(std::memory_order_acquire) == tail_.load(std::memory_order_acquire);
+    }
+
+    size_t size() const {
+        size_t head = head_.load(std::memory_order_acquire);
+        size_t tail = tail_.load(std::memory_order_acquire);
+        return (head - tail + Capacity) & (Capacity - 1);
+    }
+
+private:
+    std::vector<T> buffer_;
+    std::atomic<size_t> head_;
+    std::atomic<size_t> tail_;
 };
 
 // =============================================================================
@@ -386,10 +576,14 @@ namespace Helpers {
 // =============================================================================
 
 enum class RecorderEvent {
+    None,
     StartRecording,
     CompleteSegment,
     EndSession,
-    UpdateUI
+    UpdateUI,
+    DotShifted,
+    SegmentSaved,
+    Error
 };
 
 struct MouseEvent {
@@ -398,5 +592,53 @@ struct MouseEvent {
     int y;
     RecorderEvent event_type;
 };
+
+// High-frequency sample data (lock-free transfer)
+struct SampleData {
+    int64_t timestamp;
+    int x;
+    int y;
+    bool valid;
+};
+
+// Callback types for thread communication
+using MouseSampleCallback = std::function<void(int64_t, int, int)>;
+using EntryEventCallback = std::function<void(RecorderEvent, int64_t, int, int)>;
+using SegmentCompleteCallback = std::function<void(const SegmentData&)>;
+using ComputationCompleteCallback = std::function<void(SegmentData)>;
+
+// =============================================================================
+// CPU AFFINITY HELPER (Platform-specific optimization)
+// =============================================================================
+
+namespace ThreadUtils {
+    // Set thread name (for debugging)
+    inline void setThreadName([[maybe_unused]] const std::string& name) {
+#ifdef __linux__
+        pthread_setname_np(pthread_self(), name.substr(0, 15).c_str());
+#elif defined(__APPLE__)
+        pthread_setname_np(name.c_str());
+#endif
+    }
+
+    // Get number of hardware threads
+    inline unsigned int getHardwareThreads() {
+        unsigned int threads = std::thread::hardware_concurrency();
+        return threads > 0 ? threads : 4;  // Default to 4 if detection fails
+    }
+
+    // High-resolution sleep (more precise than std::this_thread::sleep_for)
+    inline void preciseSleep(std::chrono::nanoseconds duration) {
+        auto start = std::chrono::high_resolution_clock::now();
+        auto end = start + duration;
+
+        // Busy-wait for short sleeps, yield for longer ones
+        while (std::chrono::high_resolution_clock::now() < end) {
+            if ((end - std::chrono::high_resolution_clock::now()) > std::chrono::microseconds(100)) {
+                std::this_thread::yield();
+            }
+        }
+    }
+}
 
 #endif // SAPI_RECORDER_BALANCED_HPP
